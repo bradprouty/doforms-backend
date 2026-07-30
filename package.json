@@ -1,0 +1,8 @@
+{
+  "name": "doforms-webhook-backend",
+  "version": "1.0.0",
+  "description": "Webhook backend for doForms data",
+  "dependencies": {
+    "@vercel/kv": "^0.2.4"
+  }
+}
