@@ -1,4 +1,6 @@
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
+
+const redis = Redis.fromEnv();
 
 export default async function handler(req, res) {
   // Enable CORS
@@ -14,38 +16,38 @@ export default async function handler(req, res) {
     try {
       // Store the data received from doForms
       const incomingData = req.body;
-      
+
       console.log('Webhook received from doForms:', JSON.stringify(incomingData, null, 2));
-      
+
       // Handle different doForms data formats
       let dataToStore = [];
-      
+
       if (Array.isArray(incomingData)) {
         dataToStore = incomingData;
-      } else if (incomingData.data) {
+      } else if (incomingData && incomingData.data) {
         dataToStore = Array.isArray(incomingData.data) ? incomingData.data : [incomingData.data];
-      } else if (incomingData.records) {
+      } else if (incomingData && incomingData.records) {
         dataToStore = Array.isArray(incomingData.records) ? incomingData.records : [incomingData.records];
       } else {
         dataToStore = [incomingData];
       }
-      
-      // Store in Vercel KV (persists across requests)
-      await kv.set('doforms-data', dataToStore);
-      
-      console.log('Data stored in KV. Total records:', dataToStore.length);
-      
-      return res.status(200).json({ 
-        success: true, 
+
+      // Store in Redis (persists across requests)
+      await redis.set('doforms-data', JSON.stringify(dataToStore));
+
+      console.log('Data stored. Total records:', dataToStore.length);
+
+      return res.status(200).json({
+        success: true,
         message: 'Webhook received successfully',
-        recordsReceived: dataToStore.length 
+        recordsReceived: dataToStore.length
       });
-      
+
     } catch (error) {
       console.error('Webhook error:', error);
-      return res.status(500).json({ 
-        success: false, 
-        error: error.message 
+      return res.status(500).json({
+        success: false,
+        error: error.message
       });
     }
   }
