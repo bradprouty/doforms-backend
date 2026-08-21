@@ -1,4 +1,6 @@
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
+
+const redis = Redis.fromEnv();
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -14,7 +16,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const raw = await kv.get('doforms-data');
+    const raw = await redis.get('doforms-data');
     let data = [];
     if (raw) data = typeof raw === 'string' ? JSON.parse(raw) : raw;
     return res.status(200).json(data);
