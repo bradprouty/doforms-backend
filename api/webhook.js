@@ -1,5 +1,6 @@
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
 
+const redis = Redis.fromEnv();
 const DOFORMS_BASE = 'https://api.mydoforms.com/api/v2';
 
 function getToken() {
@@ -44,9 +45,6 @@ export default async function handler(req, res) {
 
     const token = getToken();
 
-    // The notification payload only signals that something changed - its
-    // submissionKey isn't a reliably usable identifier on its own. So treat
-    // every webhook call as a cue to resync the full submission list.
     const listResp = await fetch(`${DOFORMS_BASE}/submissions`, {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
     });
@@ -56,19 +54,19 @@ export default async function handler(req, res) {
       throw new Error(`List fetch failed (${listResp.status}): ${t}`);
     }
 
-    const list = await listResp.json(); // [{ key, id }, ...]
+    const list = await listResp.json();
 
     const records = [];
     for (const item of list) {
       const detailResp = await fetch(`${DOFORMS_BASE}/submissions/${encodeURIComponent(item.id)}`, {
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
       });
-      if (!detailResp.ok) continue; // skip any single failure rather than aborting the whole sync
+      if (!detailResp.ok) continue;
       const detail = await detailResp.json();
       records.push(flattenSubmission(detail));
     }
 
-    await kv.set('doforms-data', JSON.stringify(records));
+    await redis.set('doforms-data', JSON.stringify(records));
 
     return res.status(200).json({ success: true, recordsSynced: records.length });
   } catch (error) {
