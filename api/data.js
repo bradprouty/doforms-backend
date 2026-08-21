@@ -1,7 +1,9 @@
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
+
+const redis = Redis.fromEnv();
 
 export default async function handler(req, res) {
-  // Enable CORS
+  // Enable CORS so any domain (GitHub Pages, etc.) can read this
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -12,20 +14,21 @@ export default async function handler(req, res) {
 
   if (req.method === 'GET') {
     try {
-      // Retrieve data from Vercel KV
-      const data = await kv.get('doforms-data');
-      
-      if (!data) {
-        return res.status(200).json([]);
+      const raw = await redis.get('doforms-data');
+
+      let data = [];
+      if (raw) {
+        // Upstash may return a parsed object/array already, or a JSON string
+        data = typeof raw === 'string' ? JSON.parse(raw) : raw;
       }
-      
+
       return res.status(200).json(data);
-      
+
     } catch (error) {
-      console.error('Error retrieving data:', error);
-      return res.status(500).json({ 
-        error: 'Failed to retrieve data',
-        message: error.message 
+      console.error('Data fetch error:', error);
+      return res.status(500).json({
+        success: false,
+        error: error.message
       });
     }
   }
