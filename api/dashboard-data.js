@@ -72,6 +72,7 @@ export default async function handler(req, res) {
               lbs_feed_per_head: feed.lbs_feed_per_head,
               pct_of_total_budget: feed.pct_of_total_budget,
               predicted_weight: feed.predicted_weight,
+              bin_scale_phases: feed.bin_scale_phases,
             }
           : null,
       };
