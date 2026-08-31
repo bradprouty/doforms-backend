@@ -73,6 +73,9 @@ export default async function handler(req, res) {
               pct_of_total_budget: feed.pct_of_total_budget,
               predicted_weight: feed.predicted_weight,
               bin_scale_phases: feed.bin_scale_phases,
+              feed_per_head_per_day: feed.feed_per_head_per_day,
+              feed_rate_source: feed.feed_rate_source,
+              expected_close_date: feed.expected_close_date,
             }
           : null,
       };
