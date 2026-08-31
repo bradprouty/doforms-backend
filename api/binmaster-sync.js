@@ -3,18 +3,42 @@
 // Vercel Cron Job target. Runs entirely on Vercel -- no mill computer
 // involvement, no Python. On its own schedule (see vercel.json), this:
 //   1. Logs into BinMaster's BinCloud API (OAuth2 password grant)
-//   2. Pulls the last 10 days of raw bin-level readings for the account
+//   2. Pulls the last `days` days of raw bin-level readings for the account
+//      (default 10 -- override with ?days=N for a one-time deeper backfill,
+//      see note below)
 //   3. Derives daily consumption per bin (sum of level *drops* between
 //      consecutive readings within a calendar day -- level increases are
 //      deliveries, not consumption, and are ignored rather than subtracted)
 //   4. Aggregates per FoxPro location via BINCLOUD_VESSEL_MAP below
-//   5. Stores the result in Redis under "binmaster-feed-data"
+//   5. MERGES that into whatever daily history is already stored in Redis
+//      under "binmaster-feed-data", rather than overwriting it -- see
+//      "Why this accumulates" below
 //
 // foxpro_sync.py (on the mill computer) reads the result back via a plain
 // GET to /api/binmaster-data -- it never talks to BinCloud or holds
 // BinCloud credentials itself. This is the JS port of what used to be
 // binmaster_adapter.py; that file still exists for local testing/reference
 // but is no longer part of the live pipeline.
+//
+// Why this accumulates instead of overwriting (added 2026-08-31):
+// foxpro_sync.py only trusts BinMaster's number for a phase if EVERY day of
+// that phase has real data -- a phase that's only 90% covered still falls
+// back to the FoxPro delivery estimate rather than risk understating it.
+// Finisher phases run for weeks; if this route only ever kept the last 10
+// days, no in-progress phase could ever be fully covered and BinMaster data
+// would silently never actually get used. So each run merges its freshly
+// fetched days into the full history already in Redis (new days overwrite
+// same-day values in case of late corrections; every older day is kept).
+// Over time the daily 10-day fetch is just resilience against a missed cron
+// run -- the real coverage comes from history that never gets thrown away.
+//
+// One-time backfill for phases already in progress when this was deployed:
+// call this route once with a larger window, e.g.
+//   GET /api/binmaster-sync?days=120
+// (requires the CRON_SECRET Bearer header, same as any other call to this
+// route -- see below). How far back BinCloud actually has data is unknown
+// until you try; the response's `daysFetched`/`vesselsSeen` fields and the
+// Vercel function log will show what came back.
 //
 // Required Vercel environment variables (Project Settings -> Environment
 // Variables -- never commit these):
@@ -25,8 +49,9 @@
 //   CRON_SECRET          Optional but recommended. When set, Vercel
 //                        automatically sends it as a Bearer token on cron
 //                        invocations, and this route checks it -- stops
-//                        anyone else from hitting this URL and burning your
-//                        BinCloud API quota.
+//                        anyone else from hitting this URL (including for a
+//                        large ?days= backfill) and burning your BinCloud
+//                        API quota.
 //
 // Wire the schedule in vercel.json (repo root), e.g. once a day (the
 // Hobby-plan minimum interval):
@@ -38,7 +63,8 @@ const redis = Redis.fromEnv();
 
 const TOKEN_URL = "https://bincloud.binmaster.com/authorizationserver/connect/token";
 const API_BASE = "https://bincloud.binmaster.com/resourceapi/api/public/Vessel";
-const DAYS_BACK = 10;
+const DEFAULT_DAYS_BACK = 10;
+const MAX_DAYS_BACK = 400; // sanity cap on manual ?days= backfills
 
 // vesselId -> [FoxPro LOCATION_I, human label] -- confirmed against
 // m_locat.dbf / farm_bin.dbf capacities on 2026-08-28 (see binmaster_adapter.py
@@ -182,6 +208,21 @@ function aggregateByLocation(vesselConsumption) {
   return { byLocation, unmapped: [...unmapped] };
 }
 
+// Merges `fresh` (this run's byLocation) into `existing` (everything ever
+// stored) day-by-day. A day present in both is overwritten by the fresh
+// value (in case BinCloud corrected a late-arriving reading); every day
+// only present in `existing` is kept untouched. This is what lets a
+// long-running phase eventually become fully covered even though each run
+// only fetches a short recent window.
+function mergeByLocation(existing, fresh) {
+  const merged = {};
+  const allLocations = new Set([...Object.keys(existing || {}), ...Object.keys(fresh || {})]);
+  for (const loc of allLocations) {
+    merged[loc] = { ...(existing && existing[loc]), ...(fresh && fresh[loc]) };
+  }
+  return merged;
+}
+
 export default async function handler(req, res) {
   const { CRON_SECRET } = process.env;
   if (CRON_SECRET) {
@@ -191,20 +232,36 @@ export default async function handler(req, res) {
     }
   }
 
+  const requestedDays = parseInt(req.query && req.query.days, 10);
+  const daysBack =
+    Number.isFinite(requestedDays) && requestedDays > 0
+      ? Math.min(requestedDays, MAX_DAYS_BACK)
+      : DEFAULT_DAYS_BACK;
+
   try {
     const token = await getAccessToken();
     const endDt = new Date();
-    const startDt = new Date(endDt.getTime() - DAYS_BACK * 24 * 60 * 60 * 1000);
+    const startDt = new Date(endDt.getTime() - daysBack * 24 * 60 * 60 * 1000);
     const vessels = await fetchVesselReadingRange(token, process.env.BINCLOUD_ACCOUNT_ID, startDt, endDt);
     const perVessel = consumptionByVesselAndDay(vessels);
-    const { byLocation, unmapped } = aggregateByLocation(perVessel);
+    const { byLocation: freshByLocation, unmapped } = aggregateByLocation(perVessel);
+
+    const storedRaw = await redis.get("binmaster-feed-data");
+    const stored = storedRaw ? (typeof storedRaw === "string" ? JSON.parse(storedRaw) : storedRaw) : null;
+    const mergedByLocation = mergeByLocation(stored && stored.byLocation, freshByLocation);
 
     await redis.set(
       "binmaster-feed-data",
-      JSON.stringify({ byLocation, unmapped, updatedAt: new Date().toISOString() })
+      JSON.stringify({ byLocation: mergedByLocation, unmapped, updatedAt: new Date().toISOString() })
     );
 
-    return res.status(200).json({ ok: true, locations: Object.keys(byLocation).length, unmapped });
+    return res.status(200).json({
+      ok: true,
+      daysFetched: daysBack,
+      vesselsSeen: vessels.length,
+      locations: Object.keys(mergedByLocation).length,
+      unmapped,
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: String(err && err.message ? err.message : err) });
