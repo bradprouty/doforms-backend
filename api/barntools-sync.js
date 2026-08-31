@@ -62,10 +62,14 @@
 // One-time backfill for phases already in progress when this is deployed,
 // same idea as BinMaster's -- call once with a larger window (requires the
 // CRON_SECRET Bearer header):
-//   GET /api/barntools-sync?days=120
-// How far back BarnTools actually retains daily history is unknown until you
-// try -- the response's `daysFetched` field and the Vercel function log will
-// show what actually came back.
+//   GET /api/barntools-sync?days=99
+// Unlike BinCloud, there's a hard API ceiling here, not just an unknown
+// retention window: BarnTools' feedTimeSeries rejects the WHOLE request if a
+// series would return more than 100 daily data points (confirmed 2026-08-31
+// via a real validation error requesting 120 days) -- so 99 is the largest
+// single backfill this route will ever attempt (MAX_DAYS_BACK below). That's
+// still far more than any single FEED_BUDGET phase length, so it's enough to
+// fully backfill any phase already in progress.
 
 import { Redis } from "@upstash/redis";
 
@@ -74,7 +78,15 @@ const redis = Redis.fromEnv();
 const TOKEN_URL = "https://api.barntools.io/auth/oauth/token";
 const GRAPHQL_URL = "https://api.barntools.io/graphql";
 const DEFAULT_DAYS_BACK = 10;
-const MAX_DAYS_BACK = 400; // sanity cap on manual ?days= backfills -- real retention unconfirmed
+// HARD API LIMIT (confirmed 2026-08-31 via a real 401/validation error):
+// BarnTools' feedTimeSeries rejects the ENTIRE request -- not a partial
+// result -- if a series would return more than 100 data points at DAY1
+// granularity. 99 leaves a one-day safety margin for inclusive-range
+// off-by-one behavior. This is well beyond any single FEED_BUDGET phase
+// length (longest is ~23 days), so it's more than enough to fully backfill
+// any phase already in progress -- unlike BinCloud, there's no reason to
+// want more than this in one call.
+const MAX_DAYS_BACK = 99;
 
 // FoxPro LOCATION_I -> BarnTools tandem-bin ids / individual-bin serial
 // numbers. Confirmed 2026-08-31 -- see notes above.
