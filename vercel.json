@@ -1,0 +1,5 @@
+{
+  "crons": [
+    { "path": "/api/binmaster-sync", "schedule": "0 6 * * *" }
+  ]
+}
