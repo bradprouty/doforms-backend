@@ -3,6 +3,7 @@ import { Redis } from '@upstash/redis';
 const redis = Redis.fromEnv();
 
 export default async function handler(req, res) {
+  // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -16,12 +17,13 @@ export default async function handler(req, res) {
   }
 
   try {
-    const raw = await redis.get('doforms-data');
-    let data = [];
-    if (raw) data = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    return res.status(200).json(data);
+    const data = await redis.get('doforms-data');
+    return res.status(200).json(data || []);
   } catch (error) {
-    console.error('Data fetch error:', error);
-    return res.status(500).json({ error: error.message });
+    console.error('Error retrieving data:', error);
+    return res.status(500).json({
+      error: 'Failed to retrieve data',
+      message: error.message,
+    });
   }
 }
