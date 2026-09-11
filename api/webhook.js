@@ -17,9 +17,17 @@ function flattenSubmission(id, detail) {
   const record = { _id: id };
   const fields = (detail && detail.fields) || [];
   for (const f of fields) {
-    if (f && f.name) {
-      record[f.name] = f.data;
-    }
+    if (!f || !f.name) continue;
+    // Each field object looks like { name, data, type, <typed value> } --
+    // "data" is NOT the value itself, it's the NAME of the property that
+    // holds the value (e.g. data: "text" means the real value is in f.text;
+    // data: "integer" means it's in f.integer). Confirmed against a real
+    // submission on 2026-09-11:
+    //   { name: "GroupID", data: "text", type: "text", text: "2634NN2EN" }
+    //   { name: "Died", data: "integer", type: "numeric", integer: 31 }
+    const valueKey = f.data;
+    record[f.name] =
+      valueKey && Object.prototype.hasOwnProperty.call(f, valueKey) ? f[valueKey] : null;
   }
   return record;
 }
