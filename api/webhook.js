@@ -1,33 +1,58 @@
 import { Redis } from '@upstash/redis';
 
 const redis = Redis.fromEnv();
-const DOFORMS_BASE = 'https://api.mydoforms.com/api/v2';
+const DOFORMS_API_BASE = 'https://api.mydoforms.com/api/v2';
 
-function getToken() {
+function authHeader() {
   const id = process.env.DOFORMS_WEBSERVICE_ID;
   const password = process.env.DOFORMS_PASSWORD;
-  if (!id || !password) throw new Error('Missing DOFORMS_WEBSERVICE_ID / DOFORMS_PASSWORD env vars');
-  return `${id}:${password}`;
+  return `Bearer ${id}:${password}`;
 }
 
-function flattenSubmission(sub) {
-  const row = {};
-  for (const f of sub.fields || []) {
-    let value = null;
-    if (f.text !== undefined) value = f.text;
-    else if (f.integer !== undefined) value = f.integer;
-    else if (f.number !== undefined) value = f.number;
-    else if (f.date !== undefined) value = f.date;
-    else if (f.boolean !== undefined) value = f.boolean;
-    row[f.name] = value;
+// doForms's webhook POST body is just a change-notification envelope with
+// no real field data -- it's used here only as a trigger. The actual data
+// comes from doForms's own REST API: list every submission, then fetch each
+// one's full field data and flatten it into a plain object.
+function flattenSubmission(id, detail) {
+  const record = { _id: id };
+  const fields = (detail && detail.fields) || [];
+  for (const f of fields) {
+    if (f && f.name) {
+      record[f.name] = f.data;
+    }
   }
-  row._id = sub.id;
-  row._status = sub.status;
-  row._updated = sub.updateTime;
-  return row;
+  return record;
+}
+
+async function fetchAllSubmissions() {
+  const listResp = await fetch(`${DOFORMS_API_BASE}/submissions`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!listResp.ok) {
+    throw new Error(`doForms list failed: ${listResp.status} ${await listResp.text()}`);
+  }
+  const list = await listResp.json();
+
+  const details = await Promise.all(
+    list.map(async (item) => {
+      const detailResp = await fetch(
+        `${DOFORMS_API_BASE}/submissions/${encodeURIComponent(item.id)}`,
+        { headers: { Authorization: authHeader() } }
+      );
+      if (!detailResp.ok) {
+        console.error(`doForms detail failed for ${item.id}: ${detailResp.status}`);
+        return null;
+      }
+      const detail = await detailResp.json();
+      return flattenSubmission(item.id, detail);
+    })
+  );
+
+  return details.filter(Boolean);
 }
 
 export default async function handler(req, res) {
+  // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -41,36 +66,21 @@ export default async function handler(req, res) {
   }
 
   try {
-    console.log('Webhook notification received from doForms:', JSON.stringify(req.body));
+    const records = await fetchAllSubmissions();
+    await redis.set('doforms-data', records);
 
-    const token = getToken();
+    console.log('Resync complete. Records stored:', records.length);
 
-    const listResp = await fetch(`${DOFORMS_BASE}/submissions`, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    return res.status(200).json({
+      success: true,
+      message: 'Resync complete',
+      recordsStored: records.length,
     });
-
-    if (!listResp.ok) {
-      const t = await listResp.text();
-      throw new Error(`List fetch failed (${listResp.status}): ${t}`);
-    }
-
-    const list = await listResp.json();
-
-    const records = [];
-    for (const item of list) {
-      const detailResp = await fetch(`${DOFORMS_BASE}/submissions/${encodeURIComponent(item.id)}`, {
-        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-      });
-      if (!detailResp.ok) continue;
-      const detail = await detailResp.json();
-      records.push(flattenSubmission(detail));
-    }
-
-    await redis.set('doforms-data', JSON.stringify(records));
-
-    return res.status(200).json({ success: true, recordsSynced: records.length });
   } catch (error) {
-    console.error('Webhook error:', error);
-    return res.status(500).json({ success: false, error: error.message });
+    console.error('Webhook resync error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
   }
 }
