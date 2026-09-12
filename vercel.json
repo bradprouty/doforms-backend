@@ -1,6 +1,7 @@
 {
   "crons": [
     { "path": "/api/binmaster-sync", "schedule": "0 6 * * *" },
-    { "path": "/api/barntools-sync", "schedule": "15 6 * * *" }
+    { "path": "/api/barntools-sync", "schedule": "15 6 * * *" },
+    { "path": "/api/ap-sync", "schedule": "30 6 * * *" }
   ]
 }
