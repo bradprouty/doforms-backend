@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "description": "Webhook backend for doForms data",
   "dependencies": {
-    "@upstash/redis": "^1.0.0"
+    "@upstash/redis": "^1.0.0",
+    "imapflow": "^1.0.0",
+    "mailparser": "^3.0.0"
   }
 }
