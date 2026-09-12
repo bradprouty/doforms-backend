@@ -259,14 +259,26 @@ export default async function handler(req, res) {
       JSON.stringify({ byLocation: mergedByLocation, unmapped, updatedAt: new Date().toISOString() })
     );
 
-    return res.status(200).json({
+    const response = {
       ok: true,
       emailSubject: subject,
       emailDate: date,
       sitesSeen: Object.keys(sites).length,
       locations: Object.keys(mergedByLocation).length,
       unmapped,
-    });
+    };
+
+    // TEMPORARY DEBUG AID: if the parser found zero site sections, the real
+    // email's HTML doesn't match the structure parseApReport() expects.
+    // Include a whitespace-collapsed sample of the raw HTML so this can be
+    // diagnosed from the same test call, without needing to dig up the
+    // email's raw source separately. Safe to remove once parsing is fixed
+    // and confirmed working against a real report.
+    if (response.sitesSeen === 0) {
+      response.htmlSample = html.replace(/\s+/g, " ").trim().slice(0, 6000);
+    }
+
+    return res.status(200).json(response);
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: String(err && err.message ? err.message : err) });
