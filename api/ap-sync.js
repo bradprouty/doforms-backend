@@ -223,11 +223,36 @@ async function fetchLatestReportHtml() {
         throw new Error("Could not fetch the latest message");
       }
       const parsed = await simpleParser(source);
-      const html = parsed.html || parsed.textAsHtml;
-      if (!html) {
-        throw new Error("Latest email has no HTML content");
+
+      // AP's report is delivered as an email ATTACHMENT (an HTML file from
+      // the site's "Edge controller"), not in the email body itself --
+      // confirmed 2026-09-12 against a real report, where the body is just
+      // a one-line "Attached is your report" notice. Prefer an HTML
+      // attachment; fall back to the body's HTML if there isn't one (older
+      // report format, or a different site's controller).
+      const attachmentsInfo = (parsed.attachments || []).map((a) => ({
+        filename: a.filename || null,
+        contentType: a.contentType || null,
+        size: a.size != null ? a.size : a.content ? a.content.length : null,
+      }));
+
+      const htmlAttachment = (parsed.attachments || []).find(
+        (a) =>
+          (a.contentType && a.contentType.toLowerCase().includes("html")) ||
+          (a.filename && /\.html?$/i.test(a.filename))
+      );
+
+      let html = null;
+      let htmlSource = null;
+      if (htmlAttachment) {
+        html = htmlAttachment.content.toString("utf8");
+        htmlSource = `attachment:${htmlAttachment.filename || "(unnamed)"}`;
+      } else if (parsed.html || parsed.textAsHtml) {
+        html = parsed.html || parsed.textAsHtml;
+        htmlSource = "body";
       }
-      return { html, subject: parsed.subject, date: parsed.date };
+
+      return { html, htmlSource, attachmentsInfo, subject: parsed.subject, date: parsed.date };
     } finally {
       lock.release();
     }
@@ -246,7 +271,20 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { html, subject, date } = await fetchLatestReportHtml();
+    const { html, htmlSource, attachmentsInfo, subject, date } = await fetchLatestReportHtml();
+
+    if (!html) {
+      // No HTML in the body or any attachment -- return what we saw instead
+      // of throwing, so the attachment list is visible for diagnosis.
+      return res.status(200).json({
+        ok: false,
+        emailSubject: subject,
+        emailDate: date,
+        error: "No HTML report found in email body or attachments",
+        attachments: attachmentsInfo,
+      });
+    }
+
     const sites = parseApReport(html);
     const { byLocation: freshByLocation, unmapped } = aggregateByLocation(sites, AP_BIN_MAP, "consumption");
 
@@ -263,19 +301,20 @@ export default async function handler(req, res) {
       ok: true,
       emailSubject: subject,
       emailDate: date,
+      htmlSource,
       sitesSeen: Object.keys(sites).length,
       locations: Object.keys(mergedByLocation).length,
       unmapped,
     };
 
-    // TEMPORARY DEBUG AID: if the parser found zero site sections, the real
-    // email's HTML doesn't match the structure parseApReport() expects.
-    // Include a whitespace-collapsed sample of the raw HTML so this can be
-    // diagnosed from the same test call, without needing to dig up the
-    // email's raw source separately. Safe to remove once parsing is fixed
-    // and confirmed working against a real report.
+    // TEMPORARY DEBUG AID: if the parser still found zero site sections even
+    // after pulling HTML from the right place (body vs. attachment), include
+    // a whitespace-collapsed sample of it plus the attachment list, so any
+    // remaining structural mismatch can be diagnosed from the same test
+    // call. Safe to remove once parsing is confirmed working end to end.
     if (response.sitesSeen === 0) {
       response.htmlSample = html.replace(/\s+/g, " ").trim().slice(0, 6000);
+      response.attachments = attachmentsInfo;
     }
 
     return res.status(200).json(response);
