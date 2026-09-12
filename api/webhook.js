@@ -9,22 +9,11 @@ function authHeader() {
   return `Bearer ${id}:${password}`;
 }
 
-// doForms's webhook POST body is just a change-notification envelope with
-// no real field data -- it's used here only as a trigger. The actual data
-// comes from doForms's own REST API: list every submission, then fetch each
-// one's full field data and flatten it into a plain object.
 function flattenSubmission(id, detail) {
   const record = { _id: id };
   const fields = (detail && detail.fields) || [];
   for (const f of fields) {
     if (!f || !f.name) continue;
-    // Each field object looks like { name, data, type, <typed value> } --
-    // "data" is NOT the value itself, it's the NAME of the property that
-    // holds the value (e.g. data: "text" means the real value is in f.text;
-    // data: "integer" means it's in f.integer). Confirmed against a real
-    // submission on 2026-09-11:
-    //   { name: "GroupID", data: "text", type: "text", text: "2634NN2EN" }
-    //   { name: "Died", data: "integer", type: "numeric", integer: 31 }
     const valueKey = f.data;
     record[f.name] =
       valueKey && Object.prototype.hasOwnProperty.call(f, valueKey) ? f[valueKey] : null;
@@ -60,7 +49,6 @@ async function fetchAllSubmissions() {
 }
 
 export default async function handler(req, res) {
-  // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
