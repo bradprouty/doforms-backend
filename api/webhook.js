@@ -32,6 +32,62 @@ function flattenSubmission(id, detail) {
   return record;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// How many detail requests to have in flight at once. Confirmed 2026-09-16:
+// firing all ~40 at once via a single unbounded Promise.all got every
+// single one back as 429 (Too Many Requests) -- not a partial failure, a
+// complete one, meaning doForms's API rejects a burst of this size outright
+// rather than just throttling part of it. Kept deliberately low/conservative
+// rather than tuned right up to whatever doForms's real limit turns out to
+// be, since being a little slower is harmless but guessing too high just
+// reproduces the same 429 storm with fewer records to trigger it.
+const MAX_CONCURRENT_DETAIL_REQUESTS = 4;
+const MAX_RETRIES_PER_RECORD = 3;
+const RETRY_BASE_DELAY_MS = 700;
+
+// Fetches one submission's detail, retrying with backoff if doForms
+// rate-limits it (429) -- a 429 here is doForms saying "slow down", not a
+// real failure, so it deserves a short wait and another try rather than
+// being counted as failed on the first attempt the way any other error
+// status is.
+async function fetchDetailWithRetry(id) {
+  for (let attempt = 0; attempt <= MAX_RETRIES_PER_RECORD; attempt++) {
+    let detailResp;
+    try {
+      detailResp = await fetch(`${DOFORMS_API_BASE}/submissions/${encodeURIComponent(id)}`, {
+        headers: { Authorization: authHeader() },
+      });
+    } catch (networkErr) {
+      console.error(`doForms detail network error for ${id} (attempt ${attempt}): ${networkErr.message}`);
+      if (attempt < MAX_RETRIES_PER_RECORD) {
+        await sleep(RETRY_BASE_DELAY_MS * (attempt + 1));
+        continue;
+      }
+      return null;
+    }
+
+    if (detailResp.ok) {
+      return await detailResp.json();
+    }
+
+    if (detailResp.status === 429 && attempt < MAX_RETRIES_PER_RECORD) {
+      await sleep(RETRY_BASE_DELAY_MS * (attempt + 1));
+      continue;
+    }
+
+    console.error(`doForms detail failed for ${id}: ${detailResp.status}`);
+    return null;
+  }
+  return null;
+}
+
+// Fetches every submission's detail with only MAX_CONCURRENT_DETAIL_REQUESTS
+// in flight at a time, via a small worker-pool (rather than
+// Promise.all(list.map(...)) firing everything at once, which is what
+// triggered the 429 storm in the first place -- see Key Discovery on this).
 async function fetchAllSubmissions() {
   const listResp = await fetch(`${DOFORMS_API_BASE}/submissions`, {
     headers: { Authorization: authHeader() },
@@ -42,23 +98,27 @@ async function fetchAllSubmissions() {
   const list = await listResp.json();
 
   let failedCount = 0;
-  const details = await Promise.all(
-    list.map(async (item) => {
-      const detailResp = await fetch(
-        `${DOFORMS_API_BASE}/submissions/${encodeURIComponent(item.id)}`,
-        { headers: { Authorization: authHeader() } }
-      );
-      if (!detailResp.ok) {
-        console.error(`doForms detail failed for ${item.id}: ${detailResp.status}`);
-        failedCount++;
-        return null;
-      }
-      const detail = await detailResp.json();
-      return flattenSubmission(item.id, detail);
-    })
-  );
+  const results = new Array(list.length);
+  let nextIndex = 0;
 
-  return { records: details.filter(Boolean), attempted: list.length, failedCount };
+  async function worker() {
+    for (;;) {
+      const i = nextIndex++;
+      if (i >= list.length) return;
+      const detail = await fetchDetailWithRetry(list[i].id);
+      if (detail === null) {
+        failedCount++;
+        results[i] = null;
+      } else {
+        results[i] = flattenSubmission(list[i].id, detail);
+      }
+    }
+  }
+
+  const workerCount = Math.min(MAX_CONCURRENT_DETAIL_REQUESTS, list.length) || 1;
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+  return { records: results.filter(Boolean), attempted: list.length, failedCount };
 }
 
 export default async function handler(req, res) {
