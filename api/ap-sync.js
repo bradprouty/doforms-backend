@@ -292,9 +292,20 @@ export default async function handler(req, res) {
     const stored = storedRaw ? (typeof storedRaw === "string" ? JSON.parse(storedRaw) : storedRaw) : null;
     const mergedByLocation = mergeByLocation(stored && stored.byLocation, freshByLocation);
 
+    // Added 2026-10-08 (feed logistics dashboard): AP's "Bin Levels" table was
+    // already being parsed but thrown away. Store it too, same per-location /
+    // per-day shape and same merge-not-overwrite behavior as consumption.
+    const { byLocation: freshLevelByLocation } = aggregateByLocation(sites, AP_BIN_MAP, "level");
+    const mergedLevelByLocation = mergeByLocation(stored && stored.levelByLocation, freshLevelByLocation);
+
     await redis.set(
       "ap-feed-data",
-      JSON.stringify({ byLocation: mergedByLocation, unmapped, updatedAt: new Date().toISOString() })
+      JSON.stringify({
+        byLocation: mergedByLocation,
+        levelByLocation: mergedLevelByLocation,
+        unmapped,
+        updatedAt: new Date().toISOString(),
+      })
     );
 
     const response = {
