@@ -261,6 +261,27 @@ async function fetchLatestReportHtml() {
   }
 }
 
+// TEMPORARY (added 2026-10-08): the first deploy of level storage produced an
+// empty levelByLocation, meaning the "Bin Levels" table did not parse into
+// date rows. This records what the parser saw plus a short sample of the raw
+// "Bin Levels" section into the stored record (`levelProbe`, readable at
+// /api/ap-data) so the table's real layout can be matched. Delete once levels parse.
+function buildLevelProbe(html, sites) {
+  const out = { sites: {}, sample: null };
+  for (const [label, t] of Object.entries(sites)) {
+    out.sites[label] = {
+      consumptionRows: Object.keys(t.consumption || {}).length,
+      levelRows: Object.keys(t.level || {}).length,
+    };
+  }
+  const m = /<td colspan="2"[^>]*>\s*Bin Levels\s*<\/td>/.exec(html);
+  out.sample = m
+    ? html.slice(m.index, m.index + 3500).replace(/\s+/g, " ")
+    : "no 'Bin Levels' header found; section headers present: " +
+      [...html.matchAll(/<td colspan="2"[^>]*>\s*([^<]{3,40}?)\s*<\/td>/g)].map((x) => x[1]).slice(0, 12).join(" | ");
+  return out;
+}
+
 export default async function handler(req, res) {
   const { CRON_SECRET } = process.env;
   if (CRON_SECRET) {
@@ -303,6 +324,7 @@ export default async function handler(req, res) {
       JSON.stringify({
         byLocation: mergedByLocation,
         levelByLocation: mergedLevelByLocation,
+        levelProbe: buildLevelProbe(html, sites),
         unmapped,
         updatedAt: new Date().toISOString(),
       })
