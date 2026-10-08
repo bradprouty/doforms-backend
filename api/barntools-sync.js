@@ -264,6 +264,65 @@ function mergeByLocation(existing, fresh) {
   return merged;
 }
 
+// ---------------------------------------------------------------------------
+// Schema probe (added 2026-10-08)
+// ---------------------------------------------------------------------------
+// The feed logistics dashboard needs CURRENT BIN LEVELS for Schaap North,
+// Raak North and Raak South, but this route only queries feedTimeSeries
+// (daily consumption). Rather than guess BarnTools' field names, each run now
+// also records the names of the GraphQL query fields and types that look
+// level/bin related, into the stored record under `schemaProbe`. It is
+// readable (field names only, no data, no secrets) at /api/barntools-data.
+// Once the right query is known this probe can be deleted. Failures are
+// swallowed so they can never break the real sync.
+const PROBE_FIELDS_QUERY = `{ __schema { queryType { fields { name args { name } type { name kind ofType { name kind ofType { name kind ofType { name } } } } } } } }`;
+const PROBE_TYPE_QUERY = `query T($n: String!) { __type(name: $n) { name fields { name type { name kind ofType { name kind ofType { name kind ofType { name } } } } } } }`;
+
+function unwrapTypeName(t) {
+  let cur = t;
+  while (cur && !cur.name && cur.ofType) cur = cur.ofType;
+  return cur ? cur.name : null;
+}
+
+async function gqlRaw(token, query, variables) {
+  const resp = await fetch(GRAPHQL_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!resp.ok) throw new Error(`probe request failed: ${resp.status}`);
+  const body = await resp.json();
+  if (body.errors && body.errors.length) throw new Error(`probe errors: ${JSON.stringify(body.errors).slice(0, 300)}`);
+  return body.data;
+}
+
+async function probeSchema(token) {
+  const data = await gqlRaw(token, PROBE_FIELDS_QUERY);
+  const all = data.__schema.queryType.fields;
+  const looksRelevant = /bin|level|tank|fill|inventory|feed|sensor|tandem|reading|mass|weight/i;
+  const interesting = all.filter((f) => looksRelevant.test(f.name));
+  const out = {
+    probedAt: new Date().toISOString(),
+    totalQueryFields: all.length,
+    queryFields: interesting.map((f) => ({
+      name: f.name,
+      args: (f.args || []).map((a) => a.name),
+      returns: unwrapTypeName(f.type),
+    })),
+    types: {},
+  };
+  const typeNames = [...new Set(out.queryFields.map((f) => f.returns).filter(Boolean))].slice(0, 15);
+  for (const n of typeNames) {
+    try {
+      const t = await gqlRaw(token, PROBE_TYPE_QUERY, { n });
+      out.types[n] = ((t.__type && t.__type.fields) || []).map((f) => `${f.name}:${unwrapTypeName(f.type)}`);
+    } catch (e) {
+      out.types[n] = `error: ${String(e.message || e).slice(0, 120)}`;
+    }
+  }
+  return out;
+}
+
 export default async function handler(req, res) {
   const { CRON_SECRET } = process.env;
   if (CRON_SECRET) {
@@ -291,9 +350,16 @@ export default async function handler(req, res) {
     const stored = storedRaw ? (typeof storedRaw === "string" ? JSON.parse(storedRaw) : storedRaw) : null;
     const mergedByLocation = mergeByLocation(stored && stored.byLocation, freshByLocation);
 
+    let schemaProbe = null;
+    try {
+      schemaProbe = await probeSchema(token);
+    } catch (e) {
+      schemaProbe = { error: String(e && e.message ? e.message : e) };
+    }
+
     await redis.set(
       "barntools-feed-data",
-      JSON.stringify({ byLocation: mergedByLocation, unmapped, updatedAt: new Date().toISOString() })
+      JSON.stringify({ byLocation: mergedByLocation, unmapped, schemaProbe, updatedAt: new Date().toISOString() })
     );
 
     return res.status(200).json({
