@@ -44,6 +44,21 @@
 // Brad directly in FoxPro to 14,000/12,000 lb, which then matched BarnTools'
 // reported capacities almost exactly.
 //
+// Added 2026-10-08 (feed logistics dashboard): besides daily consumption this
+// route now ALSO stores, in the same Redis record:
+//   levelByLocation  { loc: { lbs, capacity, asOf, bins: [{label, lbs, t}] } }
+//                    the most recent bin level per location (summed over its
+//                    tandems/bins). Replaced every run.
+//   deliveryEvents   { loc: [{ t, lbs, bin }] }
+//                    feed deliveries detected as sustained level RISES in the
+//                    hourly level history, same rule as api/binmaster-sync.js.
+//   eventsFrom       earliest time the stored events can be trusted from.
+// Source: the same feedTimeSeries query, asked at HOUR1 granularity for the
+// `current` (pounds in the bin) field of each consumption bucket. The 100-point
+// ceiling mentioned below means one run covers about 4 days of hourly levels.
+// Failures in this extra step never break the daily consumption sync; the
+// error text is stored under `levelError`.
+//
 // Required Vercel environment variables (Project Settings -> Environment
 // Variables -- never commit these):
 //   BARNTOOLS_CLIENT_ID
@@ -265,77 +280,160 @@ function mergeByLocation(existing, fresh) {
 }
 
 // ---------------------------------------------------------------------------
-// Schema probe (added 2026-10-08)
+// Bin levels + delivery detection (added 2026-10-08)
 // ---------------------------------------------------------------------------
-// The feed logistics dashboard needs CURRENT BIN LEVELS for Schaap North,
-// Raak North and Raak South, but this route only queries feedTimeSeries
-// (daily consumption). Rather than guess BarnTools' field names, each run now
-// also records the names of the GraphQL query fields and types that look
-// level/bin related, into the stored record under `schemaProbe`. It is
-// readable (field names only, no data, no secrets) at /api/barntools-data.
-// Once the right query is known this probe can be deleted. Failures are
-// swallowed so they can never break the real sync.
-const TYPE_REF = `name kind ofType { name kind ofType { name kind ofType { name kind } } }`;
-const PROBE_FIELDS_QUERY = `{ __schema { queryType { fields { name args { name type { ${TYPE_REF} } } type { ${TYPE_REF} } } } } }`;
-const PROBE_TYPE_QUERY = `query T($n: String!) { __type(name: $n) { name kind fields { name type { ${TYPE_REF} } } inputFields { name type { ${TYPE_REF} } } enumValues { name } } }`;
-const PROBE_SCALARS = new Set(["ID", "String", "Int", "Float", "Boolean", "DateTime", "Date", "JSON", "JSONObject", "DateOrDateTimeISO"]);
-const PROBE_MAX_TYPES = 30;
+// HOUR1 granularity under the 100-data-point ceiling => 95 hours per run.
+const LEVEL_HOURS = 95;
+// A delivery is a stretch of rising hourly levels (small dips tolerated). Same
+// idea and defaults as api/binmaster-sync.js; hourly points are coarser, so the
+// allowed gap between points is a little looser.
+const DELIVERY_MIN_LBS = 1500;
+const DELIVERY_DIP_TOL = 400;
+const DELIVERY_MAX_GAP_MS = 3 * 60 * 60 * 1000;
+const EVENT_RETENTION_DAYS = 75;
+const EVENT_EDGE_MS = 6 * 60 * 60 * 1000;
 
-function unwrapTypeName(t) {
-  let cur = t;
-  while (cur && !cur.name && cur.ofType) cur = cur.ofType;
-  return cur ? cur.name : null;
-}
+const LEVEL_HISTORY_QUERY = `
+  query LevelHistory(
+    $tandemBinIds: [String!]
+    $sensorSerials: [String!]
+    $start: DateOrDateTimeISO
+    $end: DateOrDateTimeISO
+    $unit: MassUnit
+    $granularity: Granularity
+  ) {
+    tandems: feedTimeSeries(
+      tandemBinIds: $tandemBinIds
+      unit: $unit
+      granularity: $granularity
+      timeRangeV2: { start: $start, end: $end }
+    ) {
+      id
+      consumption { binTs lastValidReadingTs current capacity unit }
+    }
+    singles: feedTimeSeries(
+      sensorSerials: $sensorSerials
+      unit: $unit
+      granularity: $granularity
+      timeRangeV2: { start: $start, end: $end }
+    ) {
+      id
+      consumption { binTs lastValidReadingTs current capacity unit }
+    }
+  }
+`;
 
-async function gqlRaw(token, query, variables) {
+async function fetchLevelHistory(token, endDt) {
+  const startDt = new Date(endDt.getTime() - LEVEL_HOURS * 60 * 60 * 1000);
   const resp = await fetch(GRAPHQL_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ query, variables }),
+    body: JSON.stringify({
+      query: LEVEL_HISTORY_QUERY,
+      variables: {
+        tandemBinIds: ALL_TANDEM_IDS,
+        sensorSerials: ALL_SENSOR_SERIALS,
+        start: startDt.toISOString(),
+        end: endDt.toISOString(),
+        unit: "pounds",
+        granularity: "HOUR1",
+      },
+    }),
   });
-  if (!resp.ok) throw new Error(`probe request failed: ${resp.status}`);
+  if (!resp.ok) {
+    throw new Error(`BarnTools level-history request failed: ${resp.status} ${await resp.text()}`);
+  }
   const body = await resp.json();
-  if (body.errors && body.errors.length) throw new Error(`probe errors: ${JSON.stringify(body.errors).slice(0, 300)}`);
-  return body.data;
+  if (body.errors && body.errors.length) {
+    throw new Error(`BarnTools level-history returned errors: ${JSON.stringify(body.errors).slice(0, 400)}`);
+  }
+  return { data: body.data || {}, startDt };
 }
 
-// Records every top-level query (name, arguments with their types, return
-// type) and then walks the types they reference, breadth first, up to
-// PROBE_MAX_TYPES, writing each type's fields as "name:Type" strings.
-async function probeSchema(token) {
-  const data = await gqlRaw(token, PROBE_FIELDS_QUERY);
-  const all = data.__schema.queryType.fields;
-  const out = {
-    probedAt: new Date().toISOString(),
-    totalQueryFields: all.length,
-    queryFields: all.map((f) => ({
-      name: f.name,
-      args: (f.args || []).map((a) => `${a.name}:${unwrapTypeName(a.type)}`),
-      returns: unwrapTypeName(f.type),
-    })),
-    types: {},
+function detectDeliveries(readings) {
+  const events = [];
+  let run = null;
+  const close = () => {
+    if (run && run.peak - run.startMass >= DELIVERY_MIN_LBS) {
+      events.push({ t: run.peakT.toISOString(), lbs: Math.round(run.peak - run.startMass) });
+    }
+    run = null;
   };
-  const queue = [];
-  const seen = new Set();
-  const enqueue = (n) => { if (n && !PROBE_SCALARS.has(n) && !n.startsWith("__") && !seen.has(n)) { seen.add(n); queue.push(n); } };
-  for (const f of out.queryFields) { enqueue(f.returns); for (const a of f.args) enqueue(a.split(":")[1]); }
-  while (queue.length && Object.keys(out.types).length < PROBE_MAX_TYPES) {
-    const n = queue.shift();
-    try {
-      const t = (await gqlRaw(token, PROBE_TYPE_QUERY, { n })).__type;
-      if (!t) { out.types[n] = "not found"; continue; }
-      const fields = (t.fields || []).map((f) => `${f.name}:${unwrapTypeName(f.type)}`);
-      const inputs = (t.inputFields || []).map((f) => `${f.name}:${unwrapTypeName(f.type)}`);
-      out.types[n] = t.enumValues && t.enumValues.length
-        ? { kind: t.kind, enum: t.enumValues.map((e) => e.name) }
-        : { kind: t.kind, fields: fields.concat(inputs) };
-      for (const f of t.fields || []) enqueue(unwrapTypeName(f.type));
-      for (const f of t.inputFields || []) enqueue(unwrapTypeName(f.type));
-    } catch (e) {
-      out.types[n] = `error: ${String(e.message || e).slice(0, 120)}`;
+  for (let i = 1; i < readings.length; i++) {
+    const [t0, m0] = readings[i - 1];
+    const [t1, m1] = readings[i];
+    if (t1 - t0 > DELIVERY_MAX_GAP_MS) {
+      close();
+      continue;
+    }
+    if (!run) {
+      if (m1 > m0) run = { startMass: m0, peak: m1, peakT: t1 };
+      continue;
+    }
+    if (m1 > run.peak) {
+      run.peak = m1;
+      run.peakT = t1;
+    } else if (run.peak - m1 > DELIVERY_DIP_TOL) {
+      close();
     }
   }
-  return out;
+  close();
+  return events;
+}
+
+function levelsAndEvents(tandems, singles) {
+  const levelByLocation = {};
+  const eventsByLocation = {};
+  const handle = (series, locationId) => {
+    const pts = (series.consumption || [])
+      .filter((c) => c.binTs != null && c.current != null)
+      .map((c) => [new Date(c.binTs), Number(c.current), c.lastValidReadingTs ? new Date(c.lastValidReadingTs) : null, Number(c.capacity) || 0])
+      .sort((a, b) => a[0] - b[0]);
+    if (!pts.length) return;
+    const [binT, cur, validT, cap] = pts[pts.length - 1];
+    const seen = (validT || binT).toISOString();
+    if (!levelByLocation[locationId]) levelByLocation[locationId] = { lbs: 0, capacity: 0, asOf: null, bins: [] };
+    const L = levelByLocation[locationId];
+    L.lbs += cur;
+    L.capacity += cap;
+    L.bins.push({ label: String(series.id), lbs: Math.round(cur), t: seen });
+    if (!L.asOf || seen < L.asOf) L.asOf = seen; // oldest bin makes the location read as stale
+    for (const ev of detectDeliveries(pts.map((p) => [p[0], p[1]]))) {
+      if (!eventsByLocation[locationId]) eventsByLocation[locationId] = [];
+      eventsByLocation[locationId].push({ ...ev, bin: String(series.id) });
+    }
+  };
+  for (const series of tandems || []) {
+    const loc = TANDEM_ID_TO_LOCATION[series.id];
+    if (loc) handle(series, loc);
+  }
+  for (const series of singles || []) {
+    const loc = SENSOR_SERIAL_TO_LOCATION[series.id];
+    if (loc) handle(series, loc);
+  }
+  for (const L of Object.values(levelByLocation)) {
+    L.lbs = Math.round(L.lbs);
+    L.capacity = Math.round(L.capacity);
+  }
+  return { levelByLocation, eventsByLocation };
+}
+
+// Same merge rule as api/binmaster-sync.js: inside this run's window the fresh
+// detection wins; older stored events are kept; events within EVENT_EDGE_MS of
+// the window start are ignored from the fresh set (the fill may be clipped).
+function mergeEvents(existing, fresh, windowStartMs, nowMs) {
+  const cutoff = windowStartMs + EVENT_EDGE_MS;
+  const retainFrom = nowMs - EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const merged = {};
+  const locs = new Set([...Object.keys(existing || {}), ...Object.keys(fresh || {})]);
+  for (const loc of locs) {
+    const kept = ((existing && existing[loc]) || []).filter((e) => Date.parse(e.t) < cutoff);
+    const added = ((fresh && fresh[loc]) || []).filter((e) => Date.parse(e.t) >= cutoff);
+    const all = kept.concat(added).filter((e) => Date.parse(e.t) >= retainFrom);
+    all.sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+    if (all.length) merged[loc] = all;
+  }
+  return merged;
 }
 
 export default async function handler(req, res) {
@@ -365,16 +463,40 @@ export default async function handler(req, res) {
     const stored = storedRaw ? (typeof storedRaw === "string" ? JSON.parse(storedRaw) : storedRaw) : null;
     const mergedByLocation = mergeByLocation(stored && stored.byLocation, freshByLocation);
 
-    let schemaProbe = null;
+    // Level + delivery step. Isolated so that any problem here (a field name
+    // BarnTools rejects, a timeout) leaves the daily-consumption sync above
+    // fully intact; the error is stored under `levelError` for diagnosis.
+    let levelByLocation = (stored && stored.levelByLocation) || {};
+    let deliveryEvents = (stored && stored.deliveryEvents) || {};
+    let eventsFrom = (stored && stored.eventsFrom) || null;
+    let levelError = null;
     try {
-      schemaProbe = await probeSchema(token);
+      const { data: lvData, startDt: lvStart } = await fetchLevelHistory(token, endDt);
+      const found = levelsAndEvents(lvData.tandems, lvData.singles);
+      if (Object.keys(found.levelByLocation).length) {
+        levelByLocation = found.levelByLocation;
+        deliveryEvents = mergeEvents(stored && stored.deliveryEvents, found.eventsByLocation, lvStart.getTime(), endDt.getTime());
+        const edge = lvStart.getTime() + EVENT_EDGE_MS;
+        eventsFrom = new Date(stored && stored.eventsFrom ? Math.min(Date.parse(stored.eventsFrom), edge) : edge).toISOString();
+      } else {
+        levelError = "level query returned no usable `current` values";
+      }
     } catch (e) {
-      schemaProbe = { error: String(e && e.message ? e.message : e) };
+      levelError = String(e && e.message ? e.message : e).slice(0, 500);
     }
 
     await redis.set(
       "barntools-feed-data",
-      JSON.stringify({ byLocation: mergedByLocation, unmapped, schemaProbe, updatedAt: new Date().toISOString() })
+      JSON.stringify({
+        byLocation: mergedByLocation,
+        levelByLocation,
+        deliveryEvents,
+        eventsFrom,
+        levelError,
+        detection: { minLbs: DELIVERY_MIN_LBS, dipTol: DELIVERY_DIP_TOL },
+        unmapped,
+        updatedAt: new Date().toISOString(),
+      })
     );
 
     return res.status(200).json({
@@ -383,6 +505,9 @@ export default async function handler(req, res) {
       tandemsRequested: ALL_TANDEM_IDS.length,
       sensorsRequested: ALL_SENSOR_SERIALS.length,
       locations: Object.keys(mergedByLocation).length,
+      levelLocations: Object.keys(levelByLocation).length,
+      deliveryEventsStored: Object.values(deliveryEvents).reduce((n, a) => n + a.length, 0),
+      levelError,
       unmapped,
     });
   } catch (err) {
