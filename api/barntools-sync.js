@@ -275,8 +275,11 @@ function mergeByLocation(existing, fresh) {
 // readable (field names only, no data, no secrets) at /api/barntools-data.
 // Once the right query is known this probe can be deleted. Failures are
 // swallowed so they can never break the real sync.
-const PROBE_FIELDS_QUERY = `{ __schema { queryType { fields { name args { name } type { name kind ofType { name kind ofType { name kind ofType { name } } } } } } } }`;
-const PROBE_TYPE_QUERY = `query T($n: String!) { __type(name: $n) { name fields { name type { name kind ofType { name kind ofType { name kind ofType { name } } } } } } }`;
+const TYPE_REF = `name kind ofType { name kind ofType { name kind ofType { name kind } } }`;
+const PROBE_FIELDS_QUERY = `{ __schema { queryType { fields { name args { name type { ${TYPE_REF} } } type { ${TYPE_REF} } } } } }`;
+const PROBE_TYPE_QUERY = `query T($n: String!) { __type(name: $n) { name kind fields { name type { ${TYPE_REF} } } inputFields { name type { ${TYPE_REF} } } enumValues { name } } }`;
+const PROBE_SCALARS = new Set(["ID", "String", "Int", "Float", "Boolean", "DateTime", "Date", "JSON", "JSONObject", "DateOrDateTimeISO"]);
+const PROBE_MAX_TYPES = 30;
 
 function unwrapTypeName(t) {
   let cur = t;
@@ -296,26 +299,38 @@ async function gqlRaw(token, query, variables) {
   return body.data;
 }
 
+// Records every top-level query (name, arguments with their types, return
+// type) and then walks the types they reference, breadth first, up to
+// PROBE_MAX_TYPES, writing each type's fields as "name:Type" strings.
 async function probeSchema(token) {
   const data = await gqlRaw(token, PROBE_FIELDS_QUERY);
   const all = data.__schema.queryType.fields;
-  const looksRelevant = /bin|level|tank|fill|inventory|feed|sensor|tandem|reading|mass|weight/i;
-  const interesting = all.filter((f) => looksRelevant.test(f.name));
   const out = {
     probedAt: new Date().toISOString(),
     totalQueryFields: all.length,
-    queryFields: interesting.map((f) => ({
+    queryFields: all.map((f) => ({
       name: f.name,
-      args: (f.args || []).map((a) => a.name),
+      args: (f.args || []).map((a) => `${a.name}:${unwrapTypeName(a.type)}`),
       returns: unwrapTypeName(f.type),
     })),
     types: {},
   };
-  const typeNames = [...new Set(out.queryFields.map((f) => f.returns).filter(Boolean))].slice(0, 15);
-  for (const n of typeNames) {
+  const queue = [];
+  const seen = new Set();
+  const enqueue = (n) => { if (n && !PROBE_SCALARS.has(n) && !n.startsWith("__") && !seen.has(n)) { seen.add(n); queue.push(n); } };
+  for (const f of out.queryFields) { enqueue(f.returns); for (const a of f.args) enqueue(a.split(":")[1]); }
+  while (queue.length && Object.keys(out.types).length < PROBE_MAX_TYPES) {
+    const n = queue.shift();
     try {
-      const t = await gqlRaw(token, PROBE_TYPE_QUERY, { n });
-      out.types[n] = ((t.__type && t.__type.fields) || []).map((f) => `${f.name}:${unwrapTypeName(f.type)}`);
+      const t = (await gqlRaw(token, PROBE_TYPE_QUERY, { n })).__type;
+      if (!t) { out.types[n] = "not found"; continue; }
+      const fields = (t.fields || []).map((f) => `${f.name}:${unwrapTypeName(f.type)}`);
+      const inputs = (t.inputFields || []).map((f) => `${f.name}:${unwrapTypeName(f.type)}`);
+      out.types[n] = t.enumValues && t.enumValues.length
+        ? { kind: t.kind, enum: t.enumValues.map((e) => e.name) }
+        : { kind: t.kind, fields: fields.concat(inputs) };
+      for (const f of t.fields || []) enqueue(unwrapTypeName(f.type));
+      for (const f of t.inputFields || []) enqueue(unwrapTypeName(f.type));
     } catch (e) {
       out.types[n] = `error: ${String(e.message || e).slice(0, 120)}`;
     }
