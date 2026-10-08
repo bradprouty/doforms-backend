@@ -174,7 +174,12 @@ function mergeByLocation(existing, fresh) {
   return merged;
 }
 
-async function fetchLatestReportHtml() {
+// Fetches the newest `maxMessages` report emails (from AP_SENDER_EMAIL when
+// set, otherwise just the newest messages in the inbox), newest first, and
+// returns each one's HTML. Several are read because AP's "Bin Levels" table was
+// not present in the newest email on 2026-10-08 even though a report that has it
+// exists (see pickReports) -- so the latest email alone isn't always enough.
+async function fetchRecentReports(maxMessages = 8) {
   const { AP_MAILBOX_EMAIL, AP_MAILBOX_APP_PASSWORD, AP_SENDER_EMAIL } = process.env;
   if (!AP_MAILBOX_EMAIL || !AP_MAILBOX_APP_PASSWORD) {
     throw new Error("AP_MAILBOX_EMAIL and AP_MAILBOX_APP_PASSWORD must both be set");
@@ -192,67 +197,57 @@ async function fetchLatestReportHtml() {
   try {
     const lock = await client.getMailboxLock("INBOX");
     try {
-      let source = null;
+      // Search for mail from AP's own sending address rather than trusting
+      // "the newest messages in the inbox" -- see AP_SENDER_EMAIL in the header
+      // comment above for why. Without it, fall back to the newest messages
+      // (only safe for a mailbox that truly never receives anything else).
+      const uids = AP_SENDER_EMAIL
+        ? await client.search({ from: AP_SENDER_EMAIL }, { uid: true })
+        : await client.search({ all: true }, { uid: true });
+      if (!uids || !uids.length) {
+        throw new Error(AP_SENDER_EMAIL ? `No mail found from ${AP_SENDER_EMAIL} yet` : "No emails found in this mailbox yet");
+      }
+      const newestFirst = [...uids].sort((a, b) => b - a).slice(0, maxMessages);
 
-      if (AP_SENDER_EMAIL) {
-        // Search for mail from AP's own sending address rather than
-        // trusting "the newest message in the inbox" -- see AP_SENDER_EMAIL
-        // in the header comment above for why.
-        const uids = await client.search({ from: AP_SENDER_EMAIL }, { uid: true });
-        if (!uids || !uids.length) {
-          throw new Error(`No mail found from ${AP_SENDER_EMAIL} yet`);
-        }
-        const latestUid = Math.max(...uids);
-        for await (const msg of client.fetch(latestUid, { source: true }, { uid: true })) {
+      const reports = [];
+      for (const uid of newestFirst) {
+        let source = null;
+        for await (const msg of client.fetch(uid, { source: true }, { uid: true })) {
           source = msg.source;
         }
-      } else {
-        // No AP_SENDER_EMAIL configured -- fall back to "grab the newest
-        // message in the inbox," which only gives correct results if this
-        // mailbox truly never receives anything except AP's reports.
-        const total = client.mailbox.exists;
-        if (!total) {
-          throw new Error("No emails found in this mailbox yet");
+        if (!source) continue;
+        const parsed = await simpleParser(source);
+
+        // AP's report is delivered as an email ATTACHMENT (an HTML file from
+        // the site's "Edge controller"), not in the email body itself --
+        // confirmed 2026-09-12 against a real report, where the body is just
+        // a one-line "Attached is your report" notice. Prefer an HTML
+        // attachment; fall back to the body's HTML if there isn't one (older
+        // report format, or a different site's controller).
+        const attachmentsInfo = (parsed.attachments || []).map((a) => ({
+          filename: a.filename || null,
+          contentType: a.contentType || null,
+          size: a.size != null ? a.size : a.content ? a.content.length : null,
+        }));
+
+        const htmlAttachment = (parsed.attachments || []).find(
+          (a) =>
+            (a.contentType && a.contentType.toLowerCase().includes("html")) ||
+            (a.filename && /\.html?$/i.test(a.filename))
+        );
+
+        let html = null;
+        let htmlSource = null;
+        if (htmlAttachment) {
+          html = htmlAttachment.content.toString("utf8");
+          htmlSource = `attachment:${htmlAttachment.filename || "(unnamed)"}`;
+        } else if (parsed.html || parsed.textAsHtml) {
+          html = parsed.html || parsed.textAsHtml;
+          htmlSource = "body";
         }
-        for await (const msg of client.fetch(`${total}:${total}`, { source: true })) {
-          source = msg.source;
-        }
+        reports.push({ html, htmlSource, attachmentsInfo, subject: parsed.subject, date: parsed.date });
       }
-
-      if (!source) {
-        throw new Error("Could not fetch the latest message");
-      }
-      const parsed = await simpleParser(source);
-
-      // AP's report is delivered as an email ATTACHMENT (an HTML file from
-      // the site's "Edge controller"), not in the email body itself --
-      // confirmed 2026-09-12 against a real report, where the body is just
-      // a one-line "Attached is your report" notice. Prefer an HTML
-      // attachment; fall back to the body's HTML if there isn't one (older
-      // report format, or a different site's controller).
-      const attachmentsInfo = (parsed.attachments || []).map((a) => ({
-        filename: a.filename || null,
-        contentType: a.contentType || null,
-        size: a.size != null ? a.size : a.content ? a.content.length : null,
-      }));
-
-      const htmlAttachment = (parsed.attachments || []).find(
-        (a) =>
-          (a.contentType && a.contentType.toLowerCase().includes("html")) ||
-          (a.filename && /\.html?$/i.test(a.filename))
-      );
-
-      let html = null;
-      let htmlSource = null;
-      if (htmlAttachment) {
-        html = htmlAttachment.content.toString("utf8");
-        htmlSource = `attachment:${htmlAttachment.filename || "(unnamed)"}`;
-      } else if (parsed.html || parsed.textAsHtml) {
-        html = parsed.html || parsed.textAsHtml;
-        htmlSource = "body";
-      }
-
-      return { html, htmlSource, attachmentsInfo, subject: parsed.subject, date: parsed.date };
+      return reports;
     } finally {
       lock.release();
     }
@@ -261,25 +256,27 @@ async function fetchLatestReportHtml() {
   }
 }
 
-// TEMPORARY (added 2026-10-08): the first deploy of level storage produced an
-// empty levelByLocation, meaning the "Bin Levels" table did not parse into
-// date rows. This records what the parser saw plus a short sample of the raw
-// "Bin Levels" section into the stored record (`levelProbe`, readable at
-// /api/ap-data) so the table's real layout can be matched. Delete once levels parse.
-function buildLevelProbe(html, sites) {
-  const out = { sites: {}, sample: null };
-  for (const [label, t] of Object.entries(sites)) {
-    out.sites[label] = {
-      consumptionRows: Object.keys(t.consumption || {}).length,
-      levelRows: Object.keys(t.level || {}).length,
+// Chooses which email feeds what. `reports` is newest first.
+//   consumption <- the newest email that has any report HTML
+//   levels      <- the newest email whose "Bin Levels" section actually parsed
+//                  (usually the same email; older ones are the fallback)
+function pickReports(reports) {
+  const withHtml = reports.filter((r) => r.html);
+  const parsedAll = withHtml.map((r) => ({ r, sites: parseApReport(r.html) }));
+  const hasRows = (sites, kind) => Object.values(sites).some((t) => Object.keys(t[kind] || {}).length > 0);
+  const latest = parsedAll[0] || null;
+  const levelPick = parsedAll.find((p) => hasRows(p.sites, "level")) || null;
+  const scanned = reports.map((r) => {
+    const p = parsedAll.find((x) => x.r === r);
+    return {
+      date: r.date ? new Date(r.date).toISOString() : null,
+      subject: r.subject || null,
+      htmlSource: r.htmlSource,
+      hasConsumption: !!(p && hasRows(p.sites, "consumption")),
+      hasLevels: !!(p && hasRows(p.sites, "level")),
     };
-  }
-  const m = /<td colspan="2"[^>]*>\s*Bin Levels\s*<\/td>/.exec(html);
-  out.sample = m
-    ? html.slice(m.index, m.index + 3500).replace(/\s+/g, " ")
-    : "no 'Bin Levels' header found; section headers present: " +
-      [...html.matchAll(/<td colspan="2"[^>]*>\s*([^<]{3,40}?)\s*<\/td>/g)].map((x) => x[1]).slice(0, 12).join(" | ");
-  return out;
+  });
+  return { latest, levelPick, scanned };
 }
 
 export default async function handler(req, res) {
@@ -292,21 +289,23 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { html, htmlSource, attachmentsInfo, subject, date } = await fetchLatestReportHtml();
+    const reports = await fetchRecentReports();
+    const { latest, levelPick, scanned } = pickReports(reports);
 
-    if (!html) {
+    if (!latest) {
       // No HTML in the body or any attachment -- return what we saw instead
       // of throwing, so the attachment list is visible for diagnosis.
+      const first = reports[0] || {};
       return res.status(200).json({
         ok: false,
-        emailSubject: subject,
-        emailDate: date,
+        emailSubject: first.subject,
+        emailDate: first.date,
         error: "No HTML report found in email body or attachments",
-        attachments: attachmentsInfo,
+        attachments: first.attachmentsInfo,
       });
     }
 
-    const sites = parseApReport(html);
+    const { r: latestReport, sites } = latest;
     const { byLocation: freshByLocation, unmapped } = aggregateByLocation(sites, AP_BIN_MAP, "consumption");
 
     const storedRaw = await redis.get("ap-feed-data");
@@ -315,16 +314,27 @@ export default async function handler(req, res) {
 
     // Added 2026-10-08 (feed logistics dashboard): AP's "Bin Levels" table was
     // already being parsed but thrown away. Store it too, same per-location /
-    // per-day shape and same merge-not-overwrite behavior as consumption.
-    const { byLocation: freshLevelByLocation } = aggregateByLocation(sites, AP_BIN_MAP, "level");
-    const mergedLevelByLocation = mergeByLocation(stored && stored.levelByLocation, freshLevelByLocation);
+    // per-day shape and same merge-not-overwrite behavior as consumption. It is
+    // taken from the newest email that really contains a Bin Levels section.
+    let mergedLevelByLocation = (stored && stored.levelByLocation) || {};
+    let levelSource = null;
+    if (levelPick) {
+      const { byLocation: freshLevelByLocation } = aggregateByLocation(levelPick.sites, AP_BIN_MAP, "level");
+      mergedLevelByLocation = mergeByLocation(mergedLevelByLocation, freshLevelByLocation);
+      levelSource = {
+        emailDate: levelPick.r.date ? new Date(levelPick.r.date).toISOString() : null,
+        subject: levelPick.r.subject || null,
+      };
+    }
 
     await redis.set(
       "ap-feed-data",
       JSON.stringify({
         byLocation: mergedByLocation,
         levelByLocation: mergedLevelByLocation,
-        levelProbe: buildLevelProbe(html, sites),
+        levelSource,
+        // TEMPORARY diagnostic: what each recent email contained. Delete once levels are confirmed flowing.
+        emailsScanned: scanned,
         unmapped,
         updatedAt: new Date().toISOString(),
       })
@@ -332,11 +342,14 @@ export default async function handler(req, res) {
 
     const response = {
       ok: true,
-      emailSubject: subject,
-      emailDate: date,
-      htmlSource,
+      emailSubject: latestReport.subject,
+      emailDate: latestReport.date,
+      htmlSource: latestReport.htmlSource,
       sitesSeen: Object.keys(sites).length,
       locations: Object.keys(mergedByLocation).length,
+      levelLocations: Object.keys(mergedLevelByLocation).length,
+      levelsFromEmail: levelSource,
+      emailsScanned: scanned.length,
       unmapped,
     };
 
@@ -346,8 +359,8 @@ export default async function handler(req, res) {
     // remaining structural mismatch can be diagnosed from the same test
     // call. Safe to remove once parsing is confirmed working end to end.
     if (response.sitesSeen === 0) {
-      response.htmlSample = html.replace(/\s+/g, " ").trim().slice(0, 6000);
-      response.attachments = attachmentsInfo;
+      response.htmlSample = latestReport.html.replace(/\s+/g, " ").trim().slice(0, 6000);
+      response.attachments = latestReport.attachmentsInfo;
     }
 
     return res.status(200).json(response);
