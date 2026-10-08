@@ -40,6 +40,18 @@
 // until you try; the response's `daysFetched`/`vesselsSeen` fields and the
 // Vercel function log will show what came back.
 //
+// Added 2026-10-08 (feed logistics dashboard): besides daily consumption this
+// route now ALSO stores, in the same Redis record:
+//   levelByLocation  { loc: { lbs, asOf, bins: [{label, lbs, t}] } }
+//                    the most recent reading of every bin, summed per location.
+//                    Replaced (not merged) every run.
+//   deliveryEvents   { loc: [{ t, lbs, bin }] }
+//                    feed deliveries detected as sustained level RISES in a
+//                    single bin (see detectDeliveries). Merged run to run and
+//                    kept for EVENT_RETENTION_DAYS.
+// Existing fields (byLocation, unmapped, updatedAt) are unchanged, so
+// foxpro_sync.py and api/dashboard-data are unaffected.
+//
 // Required Vercel environment variables (Project Settings -> Environment
 // Variables -- never commit these):
 //   BINCLOUD_CLIENT_ID
@@ -223,6 +235,101 @@ function mergeByLocation(existing, fresh) {
   return merged;
 }
 
+// ---------------------------------------------------------------------------
+// Bin levels + delivery detection (added 2026-10-08)
+// ---------------------------------------------------------------------------
+// A delivery shows up as a bin's level climbing steadily over a stretch of
+// readings (an auger/blower fill takes minutes to hours). Drops are normal
+// consumption, so a "fill" is a run of readings that go up, tolerating small
+// dips (sensor noise, feed leaving the bin mid-fill). The run ends when the
+// level falls DELIVERY_DIP_TOL below its peak, or there is a data gap. The
+// delivery size is peak minus the level where the run started. Runs smaller
+// than DELIVERY_MIN_LBS are treated as noise and discarded.
+// Tune these three constants if the dashboard shows phantom or missed fills.
+const DELIVERY_MIN_LBS = 1500;
+const DELIVERY_DIP_TOL = 400;
+const DELIVERY_MAX_GAP_MS = 2 * 60 * 60 * 1000;
+const EVENT_RETENTION_DAYS = 75;
+const EVENT_EDGE_MS = 6 * 60 * 60 * 1000; // events this close to the window start may be clipped
+
+function detectDeliveries(readings) {
+  const events = [];
+  let run = null;
+  const close = () => {
+    if (run && run.peak - run.startMass >= DELIVERY_MIN_LBS) {
+      events.push({ t: run.peakT.toISOString(), lbs: Math.round(run.peak - run.startMass) });
+    }
+    run = null;
+  };
+  for (let i = 1; i < readings.length; i++) {
+    const [t0, m0] = readings[i - 1];
+    const [t1, m1] = readings[i];
+    if (t1 - t0 > DELIVERY_MAX_GAP_MS) {
+      close();
+      continue;
+    }
+    if (!run) {
+      if (m1 > m0) run = { startMass: m0, peak: m1, peakT: t1 };
+      continue;
+    }
+    if (m1 > run.peak) {
+      run.peak = m1;
+      run.peakT = t1;
+    } else if (run.peak - m1 > DELIVERY_DIP_TOL) {
+      close();
+    }
+  }
+  close();
+  return events;
+}
+
+function levelsAndEvents(vessels) {
+  const levelByLocation = {};
+  const eventsByLocation = {};
+  for (const vessel of vessels) {
+    const mapped = BINCLOUD_VESSEL_MAP[vessel.vesselId];
+    if (!mapped) continue;
+    const [loc, label] = mapped;
+    const readings = readingsForVessel(vessel);
+    if (!readings.length) continue;
+
+    const [lastT, lastMass] = readings[readings.length - 1];
+    if (!levelByLocation[loc]) levelByLocation[loc] = { lbs: 0, asOf: null, bins: [] };
+    const L = levelByLocation[loc];
+    L.lbs += lastMass;
+    L.bins.push({ label, lbs: Math.round(lastMass), t: lastT.toISOString() });
+    // asOf = the OLDEST bin timestamp at this location, so a single stale
+    // sensor makes the whole location read as stale rather than hiding it.
+    if (!L.asOf || lastT.toISOString() < L.asOf) L.asOf = lastT.toISOString();
+
+    for (const ev of detectDeliveries(readings)) {
+      if (!eventsByLocation[loc]) eventsByLocation[loc] = [];
+      eventsByLocation[loc].push({ ...ev, bin: label });
+    }
+  }
+  for (const L of Object.values(levelByLocation)) L.lbs = Math.round(L.lbs);
+  return { levelByLocation, eventsByLocation };
+}
+
+// Merge freshly detected events into stored history. Inside this run's fetch
+// window the fresh detection is authoritative (it sees whole fills); events
+// older than the window are kept; events within EVENT_EDGE_MS of the window
+// start are ignored from the fresh set because the fill may be clipped.
+function mergeEvents(existing, fresh, windowStartMs, nowMs) {
+  const cutoff = windowStartMs + EVENT_EDGE_MS;
+  const retainFrom = nowMs - EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const merged = {};
+  const locs = new Set([...Object.keys(existing || {}), ...Object.keys(fresh || {})]);
+  for (const loc of locs) {
+    const kept = ((existing && existing[loc]) || []).filter((e) => Date.parse(e.t) < cutoff);
+    const added = ((fresh && fresh[loc]) || []).filter((e) => Date.parse(e.t) >= cutoff);
+    const all = kept.concat(added).filter((e) => Date.parse(e.t) >= retainFrom);
+    all.sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+    if (all.length) merged[loc] = all;
+  }
+  return merged;
+}
+
 export default async function handler(req, res) {
   const { CRON_SECRET } = process.env;
   if (CRON_SECRET) {
@@ -250,9 +357,32 @@ export default async function handler(req, res) {
     const stored = storedRaw ? (typeof storedRaw === "string" ? JSON.parse(storedRaw) : storedRaw) : null;
     const mergedByLocation = mergeByLocation(stored && stored.byLocation, freshByLocation);
 
+    const { levelByLocation, eventsByLocation } = levelsAndEvents(vessels);
+    const deliveryEvents = mergeEvents(
+      stored && stored.deliveryEvents,
+      eventsByLocation,
+      startDt.getTime(),
+      endDt.getTime()
+    );
+
+    // Earliest moment the stored delivery events can be trusted from. Lets the
+    // dashboard tell "no delivery happened" apart from "we weren't watching yet".
+    const edge = startDt.getTime() + EVENT_EDGE_MS;
+    const eventsFrom = new Date(
+      stored && stored.eventsFrom ? Math.min(Date.parse(stored.eventsFrom), edge) : edge
+    ).toISOString();
+
     await redis.set(
       "binmaster-feed-data",
-      JSON.stringify({ byLocation: mergedByLocation, unmapped, updatedAt: new Date().toISOString() })
+      JSON.stringify({
+        byLocation: mergedByLocation,
+        levelByLocation,
+        deliveryEvents,
+        eventsFrom,
+        detection: { minLbs: DELIVERY_MIN_LBS, dipTol: DELIVERY_DIP_TOL },
+        unmapped,
+        updatedAt: new Date().toISOString(),
+      })
     );
 
     return res.status(200).json({
@@ -260,6 +390,8 @@ export default async function handler(req, res) {
       daysFetched: daysBack,
       vesselsSeen: vessels.length,
       locations: Object.keys(mergedByLocation).length,
+      levelLocations: Object.keys(levelByLocation).length,
+      deliveryEventsStored: Object.values(deliveryEvents).reduce((n, a) => n + a.length, 0),
       unmapped,
     });
   } catch (err) {
