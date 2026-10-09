@@ -1,0 +1,35 @@
+# .github/workflows/feed-sync.yml
+#
+# Runs the BinMaster and BarnTools syncs every 30 minutes (Vercel's free
+# plan only allows one Cron run a day). Each call does the same thing the
+# daily Vercel cron does: it pulls fresh sensor readings and stores them.
+# The AP sync is left on its daily Vercel cron -- it reads emailed reports,
+# so running it more often would not bring in anything new.
+
+name: Feed sensor sync
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"      # minute 7 and 37 of every hour (UTC)
+  workflow_dispatch: {}          # lets you press "Run workflow" to test it
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call the sync endpoints
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          fail=0
+          for ep in binmaster-sync barntools-sync; do
+            echo "== $ep"
+            if ! curl -fsS -m 60 --retry 2 --retry-delay 5 \
+                 -H "Authorization: Bearer ${CRON_SECRET}" \
+                 "https://doforms-backend.vercel.app/api/$ep"; then
+              echo "FAILED: $ep"; fail=1
+            fi
+            echo
+          done
+          exit $fail
