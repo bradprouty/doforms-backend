@@ -10,7 +10,7 @@ name: Feed sensor sync
 
 on:
   schedule:
-    - cron: "7,37 * * * *"      # minute 7 and 37 of every hour (UTC)
+    - cron: "7,22,37,52 * * * *"      # minute 7 and 37 of every hour (UTC)
   workflow_dispatch: {}          # lets you press "Run workflow" to test it
 
 jobs:
