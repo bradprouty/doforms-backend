@@ -59,6 +59,20 @@
 // Failures in this extra step never break the daily consumption sync; the
 // error text is stored under `levelError`.
 //
+// Added 2026-10-13 (per-bin weights): tandem pairs are pre-summed by BarnTools, so
+// the dashboard could only show the combined weight of a pair. This route now also
+//   (a) DISCOVERS which individual bins (serial numbers) sit inside each tandem pair,
+//       by reading the Barn -> bins / tandemBins fields through GraphQL introspection
+//       (nothing is guessed: only field names the schema really has are requested),
+//       and stores the result as `binMap` (+ the raw, trimmed `binDiscovery` for
+//       diagnosis). It re-tries at most every 6 hours until a map is found, or on
+//       demand with  GET /api/barntools-sync?discover=1  (Bearer CRON_SECRET).
+//   (b) once a map exists, asks feedTimeSeries for each individual bin's level and
+//       replaces the combined tandem entry in levelByLocation[loc].bins with one
+//       entry per bin: { label, lbs, t, cap, tandem, serial }.
+// Both steps are isolated: any failure is stored (binError) and never touches the
+// daily-consumption or combined-level sync.
+//
 // Required Vercel environment variables (Project Settings -> Environment
 // Variables -- never commit these):
 //   BARNTOOLS_CLIENT_ID
@@ -436,6 +450,196 @@ function mergeEvents(existing, fresh, windowStartMs, nowMs) {
   return merged;
 }
 
+// ---------------------------------------------------------------------------
+// Per-bin discovery and levels (added 2026-10-13)
+// ---------------------------------------------------------------------------
+// If discovery cannot work out the bins by itself, fill this in by hand:
+//   { "<tandem id>": [ { serial: "1027...", name: "West Inside" }, ... ] }
+const MANUAL_TANDEM_BINS = {};
+
+const REDISCOVER_MS = 6 * 60 * 60 * 1000;
+const T_REF = `name kind ofType { name kind ofType { name kind ofType { name kind } } }`;
+const INTRO_FIELDS = `{ __schema { queryType { fields { name args { name type { ${T_REF} } } type { ${T_REF} } } } } }`;
+const INTRO_TYPE = `query T($n: String!) { __type(name: $n) { name kind fields { name args { name type { ${T_REF} } } type { ${T_REF} } } } }`;
+// only harmless descriptive fields are requested and kept (the data endpoint is public)
+const KEEP_FIELD = /^(id|name|label|serialNumber|serial|capacity|maxMass|position|side|index|order|binId|binIds|binSerials|serialNumbers)$/i;
+const NEST_FIELD = /^(bins|tandemBins|tandemBin|bin)$/i;
+
+async function gqlRaw(token, query, variables) {
+  const resp = await fetch(GRAPHQL_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!resp.ok) throw new Error(`request failed: ${resp.status}`);
+  const body = await resp.json();
+  if (body.errors && body.errors.length) throw new Error(JSON.stringify(body.errors).slice(0, 300));
+  return body.data;
+}
+
+function unwrapT(t) {
+  let list = false;
+  for (let cur = t; cur; cur = cur.ofType) {
+    if (cur.kind === "LIST") list = true;
+    if (cur.name) return { name: cur.name, kind: cur.kind, list };
+  }
+  return { name: null, kind: null, list };
+}
+
+async function typeFields(token, name, cache) {
+  if (!cache[name]) cache[name] = (await gqlRaw(token, INTRO_TYPE, { n: name })).__type || { fields: [] };
+  return cache[name].fields || [];
+}
+
+// "id name capacity bins { id name serialNumber capacity } ..." built from the real schema
+async function selectionFor(token, typeName, depth, cache) {
+  const parts = [];
+  for (const f of await typeFields(token, typeName, cache)) {
+    if ((f.args || []).some((a) => a.type && a.type.kind === "NON_NULL")) continue;
+    const u = unwrapT(f.type);
+    if ((u.kind === "SCALAR" || u.kind === "ENUM") && KEEP_FIELD.test(f.name)) parts.push(f.name);
+    else if (depth > 0 && u.kind === "OBJECT" && NEST_FIELD.test(f.name)) {
+      const sub = await selectionFor(token, u.name, depth - 1, cache);
+      if (sub) parts.push(`${f.name} { ${sub} }`);
+    }
+  }
+  return parts.join(" ");
+}
+
+const words = (s) => String(s || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+const NOISE = new Set(["bin", "bins", "tandem", "the", "and"]);
+
+// Works out { tandemId: [ {serial,name,capacity} ] } from the barns that hold our tandems.
+function deriveBinMap(barns) {
+  const map = {};
+  const how = {};
+  for (const barn of barns) {
+    const bins = (barn.bins || []).filter((b) => b && b.serialNumber != null);
+    const bySerial = {};
+    for (const b of bins) bySerial[String(b.serialNumber)] = b;
+    const tandems = (barn.tandemBins || (barn.tandemBin ? [barn.tandemBin] : [])).filter(Boolean);
+    const ours = tandems.filter((t) => TANDEM_ID_TO_LOCATION[t.id]);
+    // unique words of each tandem name among the barn's tandems (e.g. "west" vs "east")
+    const uniq = {};
+    for (const t of tandems) {
+      const others = new Set();
+      for (const o of tandems) if (o !== t) for (const w of words(o.name)) others.add(w);
+      uniq[t.id] = words(t.name).filter((w) => !NOISE.has(w) && !others.has(w));
+    }
+    for (const t of ours) {
+      let picked = null;
+      // 1. the tandem itself lists its bins
+      const nested = (t.bins || []).filter((b) => b && (b.serialNumber != null || b.serial != null));
+      if (nested.length) {
+        picked = nested.map((b) => bySerial[String(b.serialNumber ?? b.serial)] || b);
+        how[t.id] = "tandem.bins";
+      }
+      // 2. the tandem lists bin ids / serials
+      if (!picked) {
+        const ids = t.binIds || t.binSerials || t.serialNumbers;
+        if (Array.isArray(ids) && ids.length) {
+          picked = ids.map((x) => bins.find((b) => String(b.serialNumber) === String(x) || String(b.id) === String(x))).filter(Boolean);
+          if (picked.length) how[t.id] = "tandem.binIds";
+          else picked = null;
+        }
+      }
+      // 3. match by the distinguishing word in the names (East / West ...)
+      if (!picked && uniq[t.id].length) {
+        const mine = bins.filter((b) => {
+          const w = new Set(words(b.name));
+          return uniq[t.id].every((x) => w.has(x)) &&
+            !tandems.some((o) => o !== t && uniq[o.id].length && uniq[o.id].every((x) => w.has(x)));
+        });
+        if (mine.length >= 2) { picked = mine; how[t.id] = "name"; }
+      }
+      // 4. a barn with exactly one tandem and exactly two bins
+      if (!picked && ours.length === 1 && tandems.length === 1 && bins.length >= 2) {
+        picked = bins; how[t.id] = "only tandem in barn";
+      }
+      if (picked && picked.length) {
+        map[t.id] = picked.map((b) => ({
+          serial: String(b.serialNumber ?? b.serial),
+          name: b.name || null,
+          capacity: Number(b.capacity) || null,
+        })).filter((b) => b.serial && b.serial !== "undefined");
+      }
+    }
+  }
+  for (const [id, bins] of Object.entries(MANUAL_TANDEM_BINS)) { map[id] = bins; how[id] = "manual"; }
+  return { map, how };
+}
+
+async function discoverBins(token) {
+  const out = { at: new Date().toISOString(), barnField: null, selection: null, barns: [], error: null };
+  const cache = {};
+  const data = await gqlRaw(token, INTRO_FIELDS);
+  const fields = data.__schema.queryType.fields;
+  out.queryFields = fields.map((f) => f.name);
+  const cands = fields.filter((f) => unwrapT(f.type).name === "Barn" && !(f.args || []).some((a) => a.type && a.type.kind === "NON_NULL"));
+  if (!cands.length) throw new Error("no query field returns Barn without required arguments; query fields: " + out.queryFields.join(","));
+  const f = cands.find((x) => /barns/i.test(x.name)) || cands[0];
+  out.barnField = f.name;
+  const sel = await selectionFor(token, "Barn", 2, cache);
+  out.selection = sel;
+  const body = await gqlRaw(token, `{ ${f.name} { ${sel} } }`);
+  const all = [].concat(body[f.name] || []);
+  const wanted = [...ALL_TANDEM_IDS, ...ALL_SENSOR_SERIALS];
+  out.barns = all.filter((b) => { const j = JSON.stringify(b); return wanted.some((w) => j.includes(w)); });
+  out.barnsTotal = all.length;
+  return out;
+}
+
+const BIN_LEVEL_QUERY = `
+  query BinLevels($sensorSerials: [String!], $start: DateOrDateTimeISO, $end: DateOrDateTimeISO, $unit: MassUnit, $granularity: Granularity) {
+    singles: feedTimeSeries(sensorSerials: $sensorSerials, unit: $unit, granularity: $granularity, timeRangeV2: { start: $start, end: $end }) {
+      id
+      consumption { binTs lastValidReadingTs current capacity unit }
+    }
+  }
+`;
+
+// Latest level of each mapped bin; replaces the combined tandem entry only when the
+// bins add up to the tandem's own reading (within 8% of capacity-scale error).
+async function perBinLevels(token, endDt, binMap, levelByLocation) {
+  const serials = [...new Set(Object.values(binMap).flat().map((b) => b.serial))];
+  if (!serials.length) return { used: 0, checks: {} };
+  const startDt = new Date(endDt.getTime() - 12 * 60 * 60 * 1000);   // only the latest reading is needed
+  const data = await gqlRaw(token, BIN_LEVEL_QUERY, {
+    sensorSerials: serials, start: startDt.toISOString(), end: endDt.toISOString(), unit: "pounds", granularity: "HOUR1",
+  });
+  const latest = {};
+  for (const s of data.singles || []) {
+    const pts = (s.consumption || []).filter((c) => c.binTs != null && c.current != null).sort((a, b) => new Date(a.binTs) - new Date(b.binTs));
+    if (!pts.length) continue;
+    const c = pts[pts.length - 1];
+    latest[String(s.id)] = { lbs: Number(c.current), cap: Number(c.capacity) || 0, t: (c.lastValidReadingTs || c.binTs) };
+  }
+  let used = 0;
+  const checks = {};
+  for (const [tid, bins] of Object.entries(binMap)) {
+    const loc = TANDEM_ID_TO_LOCATION[tid];
+    const L = loc && levelByLocation[loc];
+    if (!L) continue;
+    const idx = L.bins.findIndex((b) => b.label === tid);
+    if (idx < 0) continue;
+    const parts = bins.map((b) => ({ b, r: latest[b.serial] })).filter((x) => x.r);
+    if (parts.length !== bins.length) { checks[tid] = `only ${parts.length} of ${bins.length} bins returned a reading`; continue; }
+    const sum = parts.reduce((x, p) => x + p.r.lbs, 0);
+    const tandemLbs = L.bins[idx].lbs;
+    const capSum = parts.reduce((x, p) => x + (p.r.cap || 0), 0) || tandemLbs || 1;
+    const diff = Math.abs(sum - tandemLbs);
+    checks[tid] = `bins ${Math.round(sum)} vs pair ${tandemLbs} lb (diff ${Math.round(diff)})`;
+    if (diff > 0.08 * capSum) { checks[tid] += " - too far apart, kept the combined value"; continue; }
+    const repl = parts.map((p) => ({
+      label: p.b.name || p.b.serial, lbs: Math.round(p.r.lbs), t: new Date(p.r.t).toISOString(),
+      cap: Math.round(p.r.cap || p.b.capacity || 0) || null, tandem: tid, serial: p.b.serial,
+    }));
+    L.bins.splice(idx, 1, ...repl);
+    used += repl.length;
+  }
+  return { used, checks };
+}
+
 export default async function handler(req, res) {
   const { CRON_SECRET } = process.env;
   if (CRON_SECRET) {
@@ -485,6 +689,37 @@ export default async function handler(req, res) {
       levelError = String(e && e.message ? e.message : e).slice(0, 500);
     }
 
+    // Per-bin step (added 2026-10-13), fully isolated from everything above.
+    let binMap = (stored && stored.binMap) || null;
+    let binDiscovery = (stored && stored.binDiscovery) || null;
+    let binMapHow = (stored && stored.binMapHow) || null;
+    let binError = null;
+    let binChecks = null;
+    let binsUsed = 0;
+    try {
+      const forced = req.query && req.query.discover;
+      const lastTry = binDiscovery && binDiscovery.at ? Date.parse(binDiscovery.at) : 0;
+      const missing = !binMap || !Object.keys(binMap).length;
+      if (forced || (missing && endDt.getTime() - lastTry > REDISCOVER_MS)) {
+        try {
+          binDiscovery = await discoverBins(token);
+        } catch (e) {
+          binDiscovery = { at: new Date().toISOString(), error: String(e && e.message ? e.message : e).slice(0, 500) };
+        }
+        const d = deriveBinMap((binDiscovery && binDiscovery.barns) || []);
+        binMap = d.map;
+        binMapHow = d.how;
+        if (!Object.keys(binMap).length && Object.keys(MANUAL_TANDEM_BINS).length) { binMap = { ...MANUAL_TANDEM_BINS }; binMapHow = { manual: true }; }
+      }
+      if (binMap && Object.keys(binMap).length && Object.keys(levelByLocation).length) {
+        const r = await perBinLevels(token, endDt, binMap, levelByLocation);
+        binsUsed = r.used;
+        binChecks = r.checks;
+      }
+    } catch (e) {
+      binError = String(e && e.message ? e.message : e).slice(0, 500);
+    }
+
     await redis.set(
       "barntools-feed-data",
       JSON.stringify({
@@ -493,6 +728,11 @@ export default async function handler(req, res) {
         deliveryEvents,
         eventsFrom,
         levelError,
+        binMap,
+        binMapHow,
+        binDiscovery,
+        binError,
+        binChecks,
         detection: { minLbs: DELIVERY_MIN_LBS, dipTol: DELIVERY_DIP_TOL },
         unmapped,
         updatedAt: new Date().toISOString(),
@@ -508,6 +748,10 @@ export default async function handler(req, res) {
       levelLocations: Object.keys(levelByLocation).length,
       deliveryEventsStored: Object.values(deliveryEvents).reduce((n, a) => n + a.length, 0),
       levelError,
+      binMapTandems: binMap ? Object.keys(binMap).length : 0,
+      binsShown: binsUsed,
+      binError,
+      binChecks,
       unmapped,
     });
   } catch (err) {
