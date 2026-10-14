@@ -458,6 +458,7 @@ function mergeEvents(existing, fresh, windowStartMs, nowMs) {
 const MANUAL_TANDEM_BINS = {};
 
 const SCALAR_NAMES = new Set(["ID", "String", "Int", "Float", "Boolean", "DateTime", "Date", "JSON", "JSONObject", "DateOrDateTimeISO"]);
+const BIN_MAP_VERSION = 2;                // bump to make the sync re-derive the stored bin map from the stored discovery data
 const REDISCOVER_MS = 30 * 60 * 1000;      // retry a failed discovery every half hour until a map exists
 const T_REF = `name kind ofType { name kind ofType { name kind ofType { name kind } } }`;
 const INTRO_FIELDS = `{ __schema { queryType { fields { name args { name type { ${T_REF} } } type { ${T_REF} } } } } }`;
@@ -515,7 +516,8 @@ function deriveBinMap(barns) {
   const map = {};
   const how = {};
   for (const barn of barns) {
-    const bins = (barn.bins || []).filter((b) => b && b.serialNumber != null);
+    // bins that are tracked on their own (Raak North) never belong to a tandem pair, even when their name looks similar
+    const bins = (barn.bins || []).filter((b) => b && b.serialNumber != null && !SENSOR_SERIAL_TO_LOCATION[String(b.serialNumber)]);
     const bySerial = {};
     for (const b of bins) bySerial[String(b.serialNumber)] = b;
     const tandems = (barn.tandemBins || (barn.tandemBin ? [barn.tandemBin] : [])).filter(Boolean);
@@ -545,6 +547,13 @@ function deriveBinMap(barns) {
         }
       }
       // 3. match by the distinguishing word in the names (East / West ...)
+      if (!picked && uniq[t.id].length) {
+        // 3a. the tandem's distinguishing words appear as one phrase in the bin name ("Raak South - Bin East" for "Raak South")
+        const phrase = uniq[t.id].join(" ");
+        const inOrder = bins.filter((b) => (" " + words(b.name).filter((w) => !NOISE.has(w)).join(" ") + " ").includes(" " + phrase + " ") &&
+          !tandems.some((o) => o !== t && uniq[o.id].length && (" " + words(b.name).filter((w) => !NOISE.has(w)).join(" ") + " ").includes(" " + uniq[o.id].join(" ") + " ")));
+        if (inOrder.length >= 2) { picked = inOrder; how[t.id] = "name phrase"; }
+      }
       if (!picked && uniq[t.id].length) {
         const mine = bins.filter((b) => {
           const w = new Set(words(b.name));
@@ -678,6 +687,8 @@ const BIN_LEVEL_QUERY = `
 // Latest level of each mapped bin; replaces the combined tandem entry only when the
 // bins add up to the tandem's own reading (within 8% of capacity-scale error).
 async function perBinLevels(token, endDt, binMap, levelByLocation) {
+  // never let an individually-tracked bin (Raak North) sit inside a tandem pair
+  binMap = Object.fromEntries(Object.entries(binMap).map(([tid, bins]) => [tid, bins.filter((b) => !SENSOR_SERIAL_TO_LOCATION[String(b.serial)])]));
   const serials = [...new Set(Object.values(binMap).flat().map((b) => b.serial))];
   if (!serials.length) return { used: 0, checks: {} };
   const startDt = new Date(endDt.getTime() - 12 * 60 * 60 * 1000);   // only the latest reading is needed
@@ -699,16 +710,36 @@ async function perBinLevels(token, endDt, binMap, levelByLocation) {
     if (!L) continue;
     const idx = L.bins.findIndex((b) => b.label === tid);
     if (idx < 0) continue;
-    const parts = bins.map((b) => ({ b, r: latest[b.serial] })).filter((x) => x.r);
+    let parts = bins.map((b) => ({ b, r: latest[b.serial] })).filter((x) => x.r);
     if (parts.length !== bins.length) { checks[tid] = `only ${parts.length} of ${bins.length} bins returned a reading`; continue; }
-    const sum = parts.reduce((x, p) => x + p.r.lbs, 0);
     const tandemLbs = L.bins[idx].lbs;
-    const capSum = parts.reduce((x, p) => x + (p.r.cap || 0), 0) || tandemLbs || 1;
-    const diff = Math.abs(sum - tandemLbs);
+    let sum = parts.reduce((x, p) => x + p.r.lbs, 0);
+    let capSum = parts.reduce((x, p) => x + (p.r.cap || 0), 0) || tandemLbs || 1;
+    let diff = Math.abs(sum - tandemLbs);
+    let subsetNote = "";
+    // Safety net: if the candidate bins do not add up to the pair but some subset of them does, the extras do not belong to this pair.
+    const pairCap = Number(L.bins[idx].cap || L.capacity) || 0;
+    const tolOf = () => 0.08 * Math.min(capSum, pairCap || capSum);     // never looser than the pair's own capacity
+    if (diff > tolOf() && parts.length > 2 && parts.length <= 8) {
+      let best = null;
+      for (let mask = 1; mask < (1 << parts.length); mask++) {
+        const sub = parts.filter((_, i) => mask & (1 << i));
+        if (sub.length < 2 || sub.length >= parts.length) continue;
+        const sm = sub.reduce((x, p) => x + p.r.lbs, 0);
+        const d = Math.abs(sm - tandemLbs);
+        if (!best || d < best.d - 1 || (Math.abs(d - best.d) <= 1 && sub.length > best.sub.length)) best = { sub, sm, d };
+      }
+      const tol = Math.max(250, 0.01 * (parts.reduce((x, p) => x + (p.r.cap || 0), 0) || 1));
+      if (best && best.d <= tol) {
+        subsetNote = ` [dropped ${parts.filter((p) => !best.sub.includes(p)).map((p) => p.b.name || p.b.serial).join(", ")}: not part of this pair]`;
+        parts = best.sub; sum = best.sm; diff = best.d;
+        capSum = parts.reduce((x, p) => x + (p.r.cap || 0), 0) || tandemLbs || 1;
+      }
+    }
     const hhmm = (t) => { try { return new Date(t).toISOString().slice(5, 16).replace("T", " ") + "Z"; } catch { return "?"; } };
     const detail = parts.map((p) => `${p.b.name || p.b.serial} ${Math.round(p.r.lbs)} lb (cap ${Math.round(p.r.cap || 0) || "?"}, read ${hhmm(p.r.t)})`).join(" + ");
-    checks[tid] = `loc ${loc}: ${detail} = ${Math.round(sum)} vs pair ${tandemLbs} lb (cap ${L.bins[idx].cap || L.capacity || "?"}, read ${hhmm(L.bins[idx].t)}); diff ${Math.round(diff)}`;
-    if (diff > 0.08 * capSum) { checks[tid] += " - too far apart, kept the combined value"; continue; }
+    checks[tid] = `loc ${loc}: ${detail} = ${Math.round(sum)} vs pair ${tandemLbs} lb (cap ${L.bins[idx].cap || L.capacity || "?"}, read ${hhmm(L.bins[idx].t)}); diff ${Math.round(diff)}${subsetNote}`;
+    if (diff > tolOf()) { checks[tid] += " - too far apart, kept the combined value"; continue; }
     const repl = parts.map((p) => ({
       label: p.b.name || p.b.serial, lbs: Math.round(p.r.lbs), t: new Date(p.r.t).toISOString(),
       cap: Math.round(p.r.cap || p.b.capacity || 0) || null, tandem: tid, serial: p.b.serial,
@@ -779,6 +810,11 @@ export default async function handler(req, res) {
       const forced = req.query && req.query.discover;
       const lastTry = binDiscovery && binDiscovery.at ? Date.parse(binDiscovery.at) : 0;
       const missing = !binMap || !Object.keys(binMap).length;
+      const oldVersion = !missing && (!stored || stored.binMapVersion !== BIN_MAP_VERSION);
+      if (oldVersion && binDiscovery && Array.isArray(binDiscovery.barns) && binDiscovery.barns.length) {
+        const d = deriveBinMap(binDiscovery.barns);      // same discovery data, corrected rules; no extra BarnTools calls
+        if (Object.keys(d.map).length) { binMap = d.map; binMapHow = d.how; }
+      }
       if (forced || (missing && endDt.getTime() - lastTry > REDISCOVER_MS)) {
         binDiscovery = await discoverBins(token);
         const d = deriveBinMap((binDiscovery && binDiscovery.barns) || []);
@@ -805,6 +841,7 @@ export default async function handler(req, res) {
         levelError,
         binMap,
         binMapHow,
+        binMapVersion: BIN_MAP_VERSION,
         binDiscovery,
         binError,
         binChecks,
