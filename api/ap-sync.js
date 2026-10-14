@@ -266,17 +266,7 @@ function pickReports(reports) {
   const hasRows = (sites, kind) => Object.values(sites).some((t) => Object.keys(t[kind] || {}).length > 0);
   const latest = parsedAll[0] || null;
   const levelPick = parsedAll.find((p) => hasRows(p.sites, "level")) || null;
-  const scanned = reports.map((r) => {
-    const p = parsedAll.find((x) => x.r === r);
-    return {
-      date: r.date ? new Date(r.date).toISOString() : null,
-      subject: r.subject || null,
-      htmlSource: r.htmlSource,
-      hasConsumption: !!(p && hasRows(p.sites, "consumption")),
-      hasLevels: !!(p && hasRows(p.sites, "level")),
-    };
-  });
-  return { latest, levelPick, scanned };
+  return { latest, levelPick };
 }
 
 export default async function handler(req, res) {
@@ -290,7 +280,7 @@ export default async function handler(req, res) {
 
   try {
     const reports = await fetchRecentReports();
-    const { latest, levelPick, scanned } = pickReports(reports);
+    const { latest, levelPick } = pickReports(reports);
 
     if (!latest) {
       // No HTML in the body or any attachment -- return what we saw instead
@@ -333,8 +323,6 @@ export default async function handler(req, res) {
         byLocation: mergedByLocation,
         levelByLocation: mergedLevelByLocation,
         levelSource,
-        // TEMPORARY diagnostic: what each recent email contained. Delete once levels are confirmed flowing.
-        emailsScanned: scanned,
         unmapped,
         updatedAt: new Date().toISOString(),
       })
@@ -349,15 +337,14 @@ export default async function handler(req, res) {
       locations: Object.keys(mergedByLocation).length,
       levelLocations: Object.keys(mergedLevelByLocation).length,
       levelsFromEmail: levelSource,
-      emailsScanned: scanned.length,
       unmapped,
     };
 
-    // TEMPORARY DEBUG AID: if the parser still found zero site sections even
+    // Failure diagnostic: if the parser still found zero site sections even
     // after pulling HTML from the right place (body vs. attachment), include
     // a whitespace-collapsed sample of it plus the attachment list, so any
-    // remaining structural mismatch can be diagnosed from the same test
-    // call. Safe to remove once parsing is confirmed working end to end.
+    // structural mismatch can be diagnosed from the same test call. Only
+    // appears when nothing parsed.
     if (response.sitesSeen === 0) {
       response.htmlSample = latestReport.html.replace(/\s+/g, " ").trim().slice(0, 6000);
       response.attachments = latestReport.attachmentsInfo;
