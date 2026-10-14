@@ -705,7 +705,9 @@ async function perBinLevels(token, endDt, binMap, levelByLocation) {
     const tandemLbs = L.bins[idx].lbs;
     const capSum = parts.reduce((x, p) => x + (p.r.cap || 0), 0) || tandemLbs || 1;
     const diff = Math.abs(sum - tandemLbs);
-    checks[tid] = `bins ${Math.round(sum)} vs pair ${tandemLbs} lb (diff ${Math.round(diff)})`;
+    const hhmm = (t) => { try { return new Date(t).toISOString().slice(5, 16).replace("T", " ") + "Z"; } catch { return "?"; } };
+    const detail = parts.map((p) => `${p.b.name || p.b.serial} ${Math.round(p.r.lbs)} lb (cap ${Math.round(p.r.cap || 0) || "?"}, read ${hhmm(p.r.t)})`).join(" + ");
+    checks[tid] = `loc ${loc}: ${detail} = ${Math.round(sum)} vs pair ${tandemLbs} lb (cap ${L.bins[idx].cap || L.capacity || "?"}, read ${hhmm(L.bins[idx].t)}); diff ${Math.round(diff)}`;
     if (diff > 0.08 * capSum) { checks[tid] += " - too far apart, kept the combined value"; continue; }
     const repl = parts.map((p) => ({
       label: p.b.name || p.b.serial, lbs: Math.round(p.r.lbs), t: new Date(p.r.t).toISOString(),
