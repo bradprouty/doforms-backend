@@ -65,7 +65,7 @@
 //       by reading the Barn -> bins / tandemBins fields through GraphQL introspection
 //       (nothing is guessed: only field names the schema really has are requested),
 //       and stores the result as `binMap` (+ the raw, trimmed `binDiscovery` for
-//       diagnosis). It re-tries at most every 6 hours until a map is found, or on
+//       diagnosis). It re-tries every 30 minutes until a map is found, or on
 //       demand with  GET /api/barntools-sync?discover=1  (Bearer CRON_SECRET).
 //   (b) once a map exists, asks feedTimeSeries for each individual bin's level and
 //       replaces the combined tandem entry in levelByLocation[loc].bins with one
@@ -457,7 +457,8 @@ function mergeEvents(existing, fresh, windowStartMs, nowMs) {
 //   { "<tandem id>": [ { serial: "1027...", name: "West Inside" }, ... ] }
 const MANUAL_TANDEM_BINS = {};
 
-const REDISCOVER_MS = 6 * 60 * 60 * 1000;
+const SCALAR_NAMES = new Set(["ID", "String", "Int", "Float", "Boolean", "DateTime", "Date", "JSON", "JSONObject", "DateOrDateTimeISO"]);
+const REDISCOVER_MS = 30 * 60 * 1000;      // retry a failed discovery every half hour until a map exists
 const T_REF = `name kind ofType { name kind ofType { name kind ofType { name kind } } }`;
 const INTRO_FIELDS = `{ __schema { queryType { fields { name args { name type { ${T_REF} } } type { ${T_REF} } } } } }`;
 const INTRO_TYPE = `query T($n: String!) { __type(name: $n) { name kind fields { name args { name type { ${T_REF} } } type { ${T_REF} } } } }`;
@@ -569,23 +570,99 @@ function deriveBinMap(barns) {
   return { map, how };
 }
 
+// Which arguments a query field needs. Only an organisation id can be filled in (optional
+// env var BARNTOOLS_ORG_ID); a field needing anything else is skipped.
+function fillArgs(f) {
+  const req = (f.args || []).filter((a) => a.type && a.type.kind === "NON_NULL");
+  if (!req.length) return "";
+  const parts = [];
+  for (const a of req) {
+    const u = unwrapT(a.type);
+    if (/org/i.test(a.name) && (u.name === "String" || u.name === "ID") && process.env.BARNTOOLS_ORG_ID) {
+      parts.push(`${a.name}: ${JSON.stringify(process.env.BARNTOOLS_ORG_ID)}`);
+    } else return null;
+  }
+  return `(${parts.join(", ")})`;
+}
+const reqNames = (f) => (f.args || []).filter((a) => a.type && a.type.kind === "NON_NULL").map((a) => a.name);
+
+// follow a path of field names through objects and lists, collecting what is at the end
+function dig(obj, path) {
+  let cur = [obj];
+  for (const k of path) cur = cur.flatMap((o) => (o == null ? [] : [].concat(o[k]))).filter((x) => x != null);
+  return cur;
+}
+
+// Everything is recorded as it goes (even on failure) so a miss can be diagnosed from the
+// stored record alone: query fields, the field lists of the Barn / Bin / tandem types, every
+// path tried and its error.
+// The barn list is searched for breadth-first from the top-level query fields, up to three
+// levels deep (for example sites -> barns), so the exact path does not have to be known.
 async function discoverBins(token) {
-  const out = { at: new Date().toISOString(), barnField: null, selection: null, barns: [], error: null };
-  const cache = {};
-  const data = await gqlRaw(token, INTRO_FIELDS);
-  const fields = data.__schema.queryType.fields;
-  out.queryFields = fields.map((f) => f.name);
-  const cands = fields.filter((f) => unwrapT(f.type).name === "Barn" && !(f.args || []).some((a) => a.type && a.type.kind === "NON_NULL"));
-  if (!cands.length) throw new Error("no query field returns Barn without required arguments; query fields: " + out.queryFields.join(","));
-  const f = cands.find((x) => /barns/i.test(x.name)) || cands[0];
-  out.barnField = f.name;
-  const sel = await selectionFor(token, "Barn", 2, cache);
-  out.selection = sel;
-  const body = await gqlRaw(token, `{ ${f.name} { ${sel} } }`);
-  const all = [].concat(body[f.name] || []);
-  const wanted = [...ALL_TANDEM_IDS, ...ALL_SENSOR_SERIALS];
-  out.barns = all.filter((b) => { const j = JSON.stringify(b); return wanted.some((w) => j.includes(w)); });
-  out.barnsTotal = all.length;
+  const out = { at: new Date().toISOString(), barnType: null, path: null, selection: null, barns: [], types: {}, queryFields: null, feedSeriesFields: null, attempts: [], error: null };
+  try {
+    const cache = {};
+    const data = await gqlRaw(token, INTRO_FIELDS);
+    const fields = data.__schema.queryType.fields;
+    out.queryFields = fields.map((f) => f.name + (reqNames(f).length ? `(${reqNames(f).join(",")})` : ""));
+    const note = async (n) => { try { out.types[n] = (await typeFields(token, n, cache)).map((f) => `${f.name}:${unwrapT(f.type).name}`); } catch (e) { out.types[n] = "error: " + String(e.message || e).slice(0, 80); } };
+
+    // breadth-first search for a field that returns barns
+    const SKIP = /^(feedTimeSeries|sensorTimeSeries)$/;
+    const cands = [];
+    const seenTypes = new Set();
+    let queue = fields.filter((f) => !SKIP.test(f.name)).map((f) => ({ f, els: [] }));
+    let introspections = 0;
+    for (let depth = 0; depth < 3 && queue.length && cands.length < 6; depth++) {
+      const next = [];
+      for (const { f, els } of queue) {
+        const a = fillArgs(f);
+        if (a === null) continue;
+        const here = els.concat([{ name: f.name, args: a }]);
+        const u = unwrapT(f.type);
+        if (u.name === "Barn" || (/^barns$/i.test(f.name) && u.kind === "OBJECT")) {
+          out.barnType = out.barnType || u.name;
+          cands.push(here);
+          continue;
+        }
+        if (u.kind !== "OBJECT" || seenTypes.has(u.name) || introspections >= 30) continue;
+        seenTypes.add(u.name);
+        introspections++;
+        let sub;
+        try { sub = await typeFields(token, u.name, cache); } catch (e) { continue; }
+        for (const g of sub) next.push({ f: g, els: here });
+      }
+      queue = next;
+    }
+    out.barnType = out.barnType || "Barn";
+    await note(out.barnType);
+    for (const f of Array.isArray(out.types[out.barnType]) ? out.types[out.barnType] : []) {
+      const tn = f.split(":")[1];
+      if (/bin|tandem/i.test(f.split(":")[0]) && tn && !out.types[tn] && !SCALAR_NAMES.has(tn)) await note(tn);
+    }
+    const fts = fields.find((f) => f.name === "feedTimeSeries");
+    if (fts) { const n = unwrapT(fts.type).name; if (n) { await note(n); out.feedSeriesFields = out.types[n]; } }
+
+    const sel = await selectionFor(token, out.barnType, 2, cache);
+    out.selection = sel;
+    const wanted = [...ALL_TANDEM_IDS, ...ALL_SENSOR_SERIALS];
+    for (const els of cands.slice(0, 6)) {
+      const q = "{ " + els.reduceRight((inner, e) => `${e.name}${e.args} { ${inner} }`, sel) + " }";
+      const path = els.map((e) => e.name);
+      try {
+        const body = await gqlRaw(token, q);
+        const all = dig(body, path);
+        const hit = all.filter((b) => { const j = JSON.stringify(b); return wanted.some((w) => j.includes(w)); });
+        out.attempts.push({ path: path.join("."), barns: all.length, matched: hit.length });
+        if (hit.length) { out.path = path.join("."); out.barns = hit; out.barnsTotal = all.length; break; }
+      } catch (e) {
+        out.attempts.push({ path: path.join("."), error: String(e.message || e).slice(0, 200) });
+      }
+    }
+    if (!out.barns.length) out.error = cands.length ? "queried the barn list but none of our tandem ids / serials were in it" : "no query path to the barn list was found (see queryFields)";
+  } catch (e) {
+    out.error = String(e && e.message ? e.message : e).slice(0, 400);
+  }
   return out;
 }
 
@@ -701,11 +778,7 @@ export default async function handler(req, res) {
       const lastTry = binDiscovery && binDiscovery.at ? Date.parse(binDiscovery.at) : 0;
       const missing = !binMap || !Object.keys(binMap).length;
       if (forced || (missing && endDt.getTime() - lastTry > REDISCOVER_MS)) {
-        try {
-          binDiscovery = await discoverBins(token);
-        } catch (e) {
-          binDiscovery = { at: new Date().toISOString(), error: String(e && e.message ? e.message : e).slice(0, 500) };
-        }
+        binDiscovery = await discoverBins(token);
         const d = deriveBinMap((binDiscovery && binDiscovery.barns) || []);
         binMap = d.map;
         binMapHow = d.how;
