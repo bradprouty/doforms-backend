@@ -310,11 +310,11 @@ function pickForms(form) {
 
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Access-Control-Allow-Origin', '*');   // dashboard is served from GitHub Pages
   const q = req.query || {};
   const action = q.action || (req.method === 'POST' ? 'sync' : 'data');
 
   if (action === 'data') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
     const out = { generatedAt: new Date().toISOString(), forms: {} };
     for (const name of pickForms(q.form)) {
       const f = FORMS[name];
