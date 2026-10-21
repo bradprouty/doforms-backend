@@ -12,7 +12,8 @@
 //   DOFORMS_GT_WEBSERVICE_ID / DOFORMS_GT_PASSWORD   Group Treatments webservice
 //   DOFORMS_IT_WEBSERVICE_ID / DOFORMS_IT_PASSWORD   Individual Treatments webservice
 //   TREATMENTS_SYNC_KEY                              any long random string you make up
-//   SYNC_TIME_BUDGET_MS  (optional)                  seconds spent fetching details per run, in ms (default 25000)
+//   SYNC_TIME_BUDGET_MS  (optional)                  ms spent fetching details per run (default 25000)
+//   DOFORMS_PACE_MS      (optional)                  ms between detail requests (default 1500)
 //   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (already set for the Active Groups dashboard)
 
 import { Redis } from '@upstash/redis';
@@ -36,7 +37,9 @@ const FORMS = {
 };
 
 const PAGE_SIZE = 1000;              // doForms max per list call
-const CONCURRENCY = 2;               // keep low: the rate limit is undocumented
+const CONCURRENCY = 1;               // one at a time: doForms 429s after ~60 quick requests
+const PACE_MS = Number(process.env.DOFORMS_PACE_MS) || 1500; // min gap between detail requests (~40/min)
+const ID_CACHE_MS = 15 * 60 * 1000;  // during a first load, reuse the id list instead of re-listing every run
 const TIME_BUDGET_MS = Number(process.env.SYNC_TIME_BUDGET_MS) || 25000; // detail-fetch time per run (listing comes first and isn't counted)
 const LOCK_MS = 90000;               // one sync per form at a time
 const COOLDOWN_MS = 15 * 60 * 1000;  // after any 429, don't call doForms for 15 min
@@ -69,6 +72,7 @@ async function listIds(token, extra = '') {
     if (!r.ok) {
       const e = new Error(`list failed: ${r.status}`);
       e.status = r.status;
+      e.retryAfter = Number(r.headers?.get?.('retry-after')) || null;
       throw e;
     }
     const body = await r.json();
@@ -126,7 +130,7 @@ function flattenSubmission(sub) {
 // retries seemed to extend doForms' cooldown) or when the time budget runs out.
 // Saves to Redis every 10 records, so progress survives a timeout.
 async function fetchDetails(token, ids, started, hashKey) {
-  let i = 0, fetched = 0, failed = 0, stopped = null, rateLimited = false;
+  let i = 0, fetched = 0, failed = 0, stopped = null, rateLimited = false, retryAfter = null;
   const failures = [];
   let buf = {}, bufN = 0;
 
@@ -140,6 +144,7 @@ async function fetchDetails(token, ids, started, hashKey) {
     while (!stopped && i < ids.length) {
       if (Date.now() - started > TIME_BUDGET_MS) { stopped = 'time budget reached'; break; }
       const id = ids[i++];
+      const t0 = Date.now();
       const r = await df(`/submissions/${id}`, token);
       if (r.ok) {
         const rec = flattenSubmission(await r.json()); // await BEFORE touching buf (another worker may flush it)
@@ -148,19 +153,28 @@ async function fetchDetails(token, ids, started, hashKey) {
         if (bufN >= 10) await flush();
       } else if (r.status === 429) {
         stopped = 'rate limited (429)'; rateLimited = true;
+        retryAfter = Number(r.headers?.get?.('retry-after')) || null;
+        break;
       } else {
         failed++;
         if (failures.length < 10) failures.push({ id, status: r.status });
       }
+      const wait = PACE_MS - (Date.now() - t0);
+      if (wait > 0 && i < ids.length) await new Promise(res => setTimeout(res, wait));
     }
   }
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   await flush();
-  return { fetched, failedDetailRequests: failed, failures, stopped, rateLimited };
+  return { fetched, failedDetailRequests: failed, failures, stopped, rateLimited, retryAfter };
 }
 
 // ---------- sync ----------
+
+async function startCooldown(retryAfterSec) {
+  const ms = retryAfterSec ? Math.max(60000, retryAfterSec * 1000) : COOLDOWN_MS;
+  await redis.set(COOLDOWN_KEY, 1, { px: ms });
+}
 
 async function syncForm(name, opts) {
   const form = FORMS[name];
@@ -171,18 +185,26 @@ async function syncForm(name, opts) {
 
   const cooldown = await redis.pttl(COOLDOWN_KEY);
   if (cooldown > 0) {
-    return { ...result, skipped: `doForms rate-limit cooldown, ${Math.ceil(cooldown / 60000)} min left` };
+    return { ...result, skipped: `doForms rate-limit cooldown, ${Math.ceil(cooldown / 60000)} min left`, cooldownMs: cooldown };
   }
 
   const gotLock = await redis.set(lockKey, started, { nx: true, px: LOCK_MS });
-  if (!gotLock) return { ...result, skipped: 'another sync for this form is running' };
+  if (!gotLock) return { ...result, skipped: 'another sync for this form is running', busy: true };
 
   let meta = {};
   try {
     meta = (await redis.get(metaKey)) || {};
     const token = tokenFor(form);
 
-    const ids = await listIds(token);
+    // While a first load is still in progress, reuse the recent id list (saves ~3 calls and ~20s per run).
+    const idsKey = form.key + ':ids';
+    const backfilling = (meta.lastResult?.remaining || 0) > 0 && !opts.full;
+    let ids = backfilling ? await redis.get(idsKey) : null;
+    result.usedCachedList = !!ids;
+    if (!ids) {
+      ids = await listIds(token);
+      await redis.set(idsKey, ids, { px: ID_CACHE_MS });
+    }
     const idSet = new Set(ids);
     const storedIds = (await redis.hkeys(form.key)) || [];
     const storedSet = new Set(storedIds);
@@ -214,7 +236,7 @@ async function syncForm(name, opts) {
       toFetch = ids;
     } else {
       const want = new Set(ids.filter(id => !storedSet.has(id)));
-      if (meta.lastSync) {
+      if (meta.lastSync && !result.usedCachedList) {
         const begin = new Date(Date.parse(meta.lastSync) - CHANGE_OVERLAP_MS).toISOString();
         const end = new Date(started + 24 * 3600 * 1000).toISOString();
         try {
@@ -235,14 +257,14 @@ async function syncForm(name, opts) {
     result.remaining = toFetch.length - fr.fetched;
 
     if (fr.rateLimited) {
-      await redis.set(COOLDOWN_KEY, 1, { px: COOLDOWN_MS });
+      await startCooldown(fr.retryAfter);
       result.status = 429;
     }
     if (result.remaining === 0) meta.lastSync = result.startedAt;
     return result;
   } catch (e) {
     if (e.status === 429) {
-      await redis.set(COOLDOWN_KEY, 1, { px: COOLDOWN_MS });
+      await startCooldown(e.retryAfter);
       result.rateLimited = true;
     }
     result.error = e.message;
