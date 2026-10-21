@@ -87,8 +87,13 @@ function flattenFields(fields) {
   const rec = {};
   for (const f of fields || []) {
     if (!f || !f.name) continue;
-    if (['label', 'action', 'instruction', 'page', 'button'].includes(f.type)) continue;
+    if (['label', 'action', 'instruction', 'page', 'button', 'email', 'fax'].includes(f.type)) continue; // email = addresses, keep out of public data
     let v = f.data ? f[f.data] : undefined;
+    if (f.data === 'time' && typeof v === 'string') {
+      const m = v.match(/T(\d{2}:\d{2})/);                     // "1970-01-01T15:39:00.000-05:00" -> "15:39"
+      rec[f.name] = m ? m[1] : v;
+      continue;
+    }
     if (f.data === 'rows' && Array.isArray(v)) {
       v = v.map(row => flattenFields(row.fields));            // table / repeat -> array of objects
     } else if (f.data === 'fields' && Array.isArray(v)) {
