@@ -12,7 +12,7 @@
 //   DOFORMS_GT_WEBSERVICE_ID / DOFORMS_GT_PASSWORD   Group Treatments webservice
 //   DOFORMS_IT_WEBSERVICE_ID / DOFORMS_IT_PASSWORD   Individual Treatments webservice
 //   TREATMENTS_SYNC_KEY                              any long random string you make up
-//   SYNC_TIME_BUDGET_MS  (optional)                  default 8000; raise to 45000 if your functions allow 60s
+//   SYNC_TIME_BUDGET_MS  (optional)                  seconds spent fetching details per run, in ms (default 25000)
 //   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (already set for the Active Groups dashboard)
 
 import { Redis } from '@upstash/redis';
@@ -37,8 +37,8 @@ const FORMS = {
 
 const PAGE_SIZE = 1000;              // doForms max per list call
 const CONCURRENCY = 2;               // keep low: the rate limit is undocumented
-const TIME_BUDGET_MS = Number(process.env.SYNC_TIME_BUDGET_MS) || 8000;
-const LOCK_MS = 60000;               // one sync per form at a time
+const TIME_BUDGET_MS = Number(process.env.SYNC_TIME_BUDGET_MS) || 25000; // detail-fetch time per run (listing comes first and isn't counted)
+const LOCK_MS = 90000;               // one sync per form at a time
 const COOLDOWN_MS = 15 * 60 * 1000;  // after any 429, don't call doForms for 15 min
 const COOLDOWN_KEY = 'doforms-treatments:cooldown';
 const CHANGE_OVERLAP_MS = 10 * 60 * 1000;
@@ -230,7 +230,7 @@ async function syncForm(name, opts) {
     }
     result.toFetch = toFetch.length;
 
-    const fr = await fetchDetails(token, toFetch, started, form.key);
+    const fr = await fetchDetails(token, toFetch, Date.now(), form.key); // budget starts after listing
     Object.assign(result, fr);
     result.remaining = toFetch.length - fr.fetched;
 
