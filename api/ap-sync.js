@@ -162,6 +162,38 @@ function aggregateByLocation(sites, binMap, kind = "consumption") {
   return { byLocation, unmapped: [...unmapped] };
 }
 
+// Same idea, but keeps every bin separate: { location: { binLetter: { date: lbs } } }.
+// Added 2026-10-22 so the Feed Logistics page can show and compare the bins of a
+// barn instead of only the barn total (the report has A, B, C, D separately).
+function aggregateByBin(sites, binMap, kind = "consumption") {
+  const byBin = {};
+  for (const [siteLabel, tables] of Object.entries(sites)) {
+    const siteMap = binMap[siteLabel];
+    if (!siteMap) continue;
+    for (const [rowDate, binValues] of Object.entries(tables[kind] || {})) {
+      for (const [binLabel, lbs] of Object.entries(binValues)) {
+        const loc = siteMap[binLabel];
+        if (loc == null) continue;
+        if (!byBin[loc]) byBin[loc] = {};
+        if (!byBin[loc][binLabel]) byBin[loc][binLabel] = {};
+        byBin[loc][binLabel][rowDate] = lbs;
+      }
+    }
+  }
+  return byBin;
+}
+
+function mergeByBin(existing, fresh) {
+  const merged = {};
+  const locs = new Set([...Object.keys(existing || {}), ...Object.keys(fresh || {})]);
+  for (const loc of locs) {
+    merged[loc] = {};
+    const bins = new Set([...Object.keys((existing && existing[loc]) || {}), ...Object.keys((fresh && fresh[loc]) || {})]);
+    for (const b of bins) merged[loc][b] = { ...(existing && existing[loc] && existing[loc][b]), ...(fresh && fresh[loc] && fresh[loc][b]) };
+  }
+  return merged;
+}
+
 // Same merge-not-overwrite approach as api/binmaster-sync.js -- a day
 // present in both is overwritten by the fresh value, every older day only
 // present in `existing` is kept.
@@ -301,16 +333,19 @@ export default async function handler(req, res) {
     const storedRaw = await redis.get("ap-feed-data");
     const stored = storedRaw ? (typeof storedRaw === "string" ? JSON.parse(storedRaw) : storedRaw) : null;
     const mergedByLocation = mergeByLocation(stored && stored.byLocation, freshByLocation);
+    const mergedByBin = mergeByBin(stored && stored.byBin, aggregateByBin(sites, AP_BIN_MAP, "consumption"));
 
     // Added 2026-10-08 (feed logistics dashboard): AP's "Bin Levels" table was
     // already being parsed but thrown away. Store it too, same per-location /
     // per-day shape and same merge-not-overwrite behavior as consumption. It is
     // taken from the newest email that really contains a Bin Levels section.
     let mergedLevelByLocation = (stored && stored.levelByLocation) || {};
+    let mergedLevelByBin = (stored && stored.levelByBin) || {};
     let levelSource = null;
     if (levelPick) {
       const { byLocation: freshLevelByLocation } = aggregateByLocation(levelPick.sites, AP_BIN_MAP, "level");
       mergedLevelByLocation = mergeByLocation(mergedLevelByLocation, freshLevelByLocation);
+      mergedLevelByBin = mergeByBin(mergedLevelByBin, aggregateByBin(levelPick.sites, AP_BIN_MAP, "level"));
       levelSource = {
         emailDate: levelPick.r.date ? new Date(levelPick.r.date).toISOString() : null,
         subject: levelPick.r.subject || null,
@@ -322,6 +357,8 @@ export default async function handler(req, res) {
       JSON.stringify({
         byLocation: mergedByLocation,
         levelByLocation: mergedLevelByLocation,
+        byBin: mergedByBin,                 // per bin letter (A-D): { location: { bin: { date: lbs } } }
+        levelByBin: mergedLevelByBin,
         levelSource,
         unmapped,
         updatedAt: new Date().toISOString(),
@@ -336,6 +373,7 @@ export default async function handler(req, res) {
       sitesSeen: Object.keys(sites).length,
       locations: Object.keys(mergedByLocation).length,
       levelLocations: Object.keys(mergedLevelByLocation).length,
+      levelBins: Object.values(mergedLevelByBin).reduce((n, o) => n + Object.keys(o).length, 0),
       levelsFromEmail: levelSource,
       unmapped,
     };
