@@ -13,6 +13,12 @@
       "schedule": "30 6 * * *"
     }
   ],
+  "rewrites": [
+    {
+      "source": "/mcp/:mcpkey",
+      "destination": "/api/treatments?action=mcp&mcpkey=:mcpkey"
+    }
+  ],
   "headers": [
     {
       "source": "/api/(binmaster|barntools|ap)-data",
