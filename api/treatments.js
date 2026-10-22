@@ -7,6 +7,7 @@
 //   GET  /api/treatments?action=sync&form=group&key=SECRET          -> manual sync (repeat until remaining = 0)
 //   GET  /api/treatments?action=sync&form=group&key=SECRET&full=1   -> re-fetch every record
 //   GET  /api/treatments?action=inspect&form=group&key=SECRET       -> show one record's real field names
+//   POST /mcp/MCP_KEY                            -> Claude connector (read-only), see lib/mcp.js
 //
 // Env vars (Vercel -> Settings -> Environment Variables, then redeploy):
 //   DOFORMS_GT_WEBSERVICE_ID / DOFORMS_GT_PASSWORD   Group Treatments webservice
@@ -17,6 +18,7 @@
 //   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (already set for the Active Groups dashboard)
 
 import { Redis } from '@upstash/redis';
+import { handleMcp } from '../lib/mcp.js';
 
 const redis = Redis.fromEnv();
 const BASE = 'https://api.mydoforms.com/api/v2';
@@ -310,8 +312,12 @@ function pickForms(form) {
 
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Access-Control-Allow-Origin', '*');   // dashboard is served from GitHub Pages
   const q = req.query || {};
+
+  // Claude connector (read-only MCP). Reached via /mcp/<MCP_KEY>, see vercel.json and lib/mcp.js.
+  if (q.action === 'mcp') return handleMcp(req, res, redis);
+
+  res.setHeader('Access-Control-Allow-Origin', '*');   // dashboard is served from GitHub Pages
   const action = q.action || (req.method === 'POST' ? 'sync' : 'data');
 
   if (action === 'data') {
